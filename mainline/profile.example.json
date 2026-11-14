@@ -1,0 +1,16 @@
+{
+  "checkpoint": "/path/to/existing/derived-checkpoint",
+  "assets": "/path/to/new/mainline-assets",
+  "engram": ["/path/to/mainline-engram-rank0", "/path/to/mainline-engram-rank1"],
+  "prepared": ["/path/to/new/mainline-weight-cache-rank0", "/path/to/new/mainline-weight-cache-rank1"],
+  "master": "192.0.2.1",
+  "master_port": 29624,
+  "image": "tensorfold-dsv41:mainline-2ba55ec7",
+  "context": 524288,
+  "pool": 2621440,
+  "parallel": 4,
+  "max_tokens": 32768,
+  "model_name": "spark",
+  "backend_port": 18036,
+  "disk_cache": {"enabled": true, "ttl_hours": 24, "memory_floor_gib": 3.5}
+}

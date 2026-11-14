@@ -267,3 +267,11 @@ third-party parts keep theirs ([`NOTICE`](NOTICE)).
   built on (CUDA, NCCL, cuBLAS; under NVIDIA's container license).
 
 Full list, with commits: [`CREDITS.md`](CREDITS.md).
+
+## Experimental current-TensorFold build profile
+
+The opt-in [mainline migration](mainline/README.md) pins current TensorFold main
+and reconciles the legacy patch stack without replacing this recipe's existing
+launcher. It prepares source, CPU asset tools and a CUDA build context. GPU
+qualification and explicit cache-policy parity gates remain outstanding; no
+production selection or client compaction setting is changed.

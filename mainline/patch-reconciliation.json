@@ -1,0 +1,464 @@
+{
+  "schema_version": 1,
+  "base": "2ba55ec7d32d0bec446bb012678550be7ef52895",
+  "legacy_patches": [
+    {
+      "legacy_patch": "0001-c7-indexer-split.patch",
+      "sha256": "a6010df6be177aa756570b9111dbf67bb6d9d0152b233a03cf333ded88b24f9a",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/block_prefill_select.zig",
+      "required_check_or_reason": "Native distributed indexer planning replaces the old patch point; remeasure TP2 prefill."
+    },
+    {
+      "legacy_patch": "0004-call-gate.patch",
+      "sha256": "e955bb260b2f5c6eb1cf25e767b002d2a5cee6f7bbe07c0e99a11c10a8c36baf",
+      "apply_to_mainline": false,
+      "disposition": "replacement-pr",
+      "candidate_owner": "zig/src/families/deepseek_v41/serve_engine.zig",
+      "required_check_or_reason": "PR3026 wires required/named and strict tool grammars into the current core; libtfgrammar is required."
+    },
+    {
+      "legacy_patch": "0005-prefill-interleave.patch",
+      "sha256": "cda21ed0779cb91e4372bf33f82aa2abdb556f353b01ebcaa21658320cea5904",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/sched_host.zig",
+      "required_check_or_reason": "Current prompt-piece scheduler owns interleaving; full-prefill latency/cancellation must be tested."
+    },
+    {
+      "legacy_patch": "0008-pool-window.patch",
+      "sha256": "fb10feb1815c7bd197b2000d7b306e78255329a93901493daa3707cf7c3538ad",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/cuda_kv.zig",
+      "required_check_or_reason": "Use TF_DSV41_POOL_TOKENS and TF_DSV41_CONTEXT; assert resolved capacity, not just environment values."
+    },
+    {
+      "legacy_patch": "0010-rdma-idle-nap.patch",
+      "sha256": "9f12646cb3262b288b55689a302e75bc6b004057d76c84e87c771a3129a94caa",
+      "apply_to_mainline": false,
+      "disposition": "revalidate",
+      "candidate_owner": "zig/src/fabric/tp",
+      "required_check_or_reason": "Current multi-rank transport replaces the old RDMA loop; idle power and wake-up behavior unmeasured."
+    },
+    {
+      "legacy_patch": "0011-cuda-budget-parked-pages.patch",
+      "sha256": "f830a026a301f99c04fc6a2a773fcb84a0a993a0716b8b734d0c88e3e4dc4cd7",
+      "apply_to_mainline": false,
+      "disposition": "revalidate",
+      "candidate_owner": "zig/src/families/deepseek_v41/cuda_kv.zig",
+      "required_check_or_reason": "Current memory planner owns startup sizing; parked-page and actual headroom equivalence unproven."
+    },
+    {
+      "legacy_patch": "0012-dsv41-base-fixes.patch",
+      "sha256": "485ab165c54fd1ed34eb60b04325cad1c2877a7731179534c43b4558555f3d2d",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/engram_recovery_test.zig",
+      "required_check_or_reason": "Old branch rebase fixes are not replayed; current Engram failure tests are the candidate owner."
+    },
+    {
+      "legacy_patch": "0013-core-spill-store.patch",
+      "sha256": "8f7569d94caecb6b7fb78a40b6f022808194713c18a80b6bfe23e9a9cd1d3324",
+      "apply_to_mainline": false,
+      "disposition": "cache-migration",
+      "candidate_owner": "zig/src/sessions",
+      "required_check_or_reason": "Mainline session/disk store is a different implementation and format. No legacy spill data import."
+    },
+    {
+      "legacy_patch": "0014-core-cache-tier.patch",
+      "sha256": "4449fd7b90b5093593f6ec33eff312b547b0e678fd99e2a9054a19af91cb2b6e",
+      "apply_to_mainline": false,
+      "disposition": "cache-migration",
+      "candidate_owner": "zig/src/families/deepseek_v41/sessions_gpu.zig",
+      "required_check_or_reason": "Use native session adapter; prove continuation and concurrent restore behavior."
+    },
+    {
+      "legacy_patch": "0015-dsv41-kv-shard-attn.patch",
+      "sha256": "51b872d08f92790acce08b9c2c8de1b9cbc4398eea36002e9b039e3993a2b564",
+      "apply_to_mainline": false,
+      "disposition": "not-carried",
+      "candidate_owner": "zig/src/families/deepseek_v41/cuda_kv.zig",
+      "required_check_or_reason": "KV split is a different native path; no old KV-shard switch is forwarded or enabled for this profile."
+    },
+    {
+      "legacy_patch": "0016-dsv41-spill-blocks.patch",
+      "sha256": "7e43ba98d1c3bf4ae76ee1a524095bfa0598d9e670d43ff59dceaed40f4cb70d",
+      "apply_to_mainline": false,
+      "disposition": "cache-migration",
+      "candidate_owner": "zig/src/families/deepseek_v41/sessions_gpu.zig",
+      "required_check_or_reason": "Native session disk options replace TF_DS_SPILL_*; cache admission/expiry parity remains blocking."
+    },
+    {
+      "legacy_patch": "0017-dsv41-kit-row-split.patch",
+      "sha256": "32dfcac73b17852053f2a4a701a2cdc50f3a356ac7e7dfa9253b7803f3d8fa36",
+      "apply_to_mainline": false,
+      "disposition": "new-assets",
+      "candidate_owner": "zig/build/dsv41_images.zig",
+      "required_check_or_reason": "Rebuild native family images and captured AOT variants for the pinned source; old kit binaries are not reused."
+    },
+    {
+      "legacy_patch": "0018-dsv41-kv-shard-lanes.patch",
+      "sha256": "31540ac83d239dd1285bdc32be7519fa0320e0d19c1f2a445cf396bbc0158fa5",
+      "apply_to_mainline": false,
+      "disposition": "not-carried",
+      "candidate_owner": "zig/src/families/deepseek_v41/sessions_gpu.zig",
+      "required_check_or_reason": "Do not transplant old sharded-lane code; qualify current multi-slot/page planner independently."
+    },
+    {
+      "legacy_patch": "0019-dsv41-spill-kv-shard.patch",
+      "sha256": "098a286bac4f67579c6ef62c73d0682ac545bb74e8607cae143f72c7e9ebc94a",
+      "apply_to_mainline": false,
+      "disposition": "cache-migration",
+      "candidate_owner": "zig/src/families/deepseek_v41/sessions_gpu.zig",
+      "required_check_or_reason": "Old sharded spill format is incompatible; a new namespace and recovery tests are required."
+    },
+    {
+      "legacy_patch": "0020-dsv41-pair-broken.patch",
+      "sha256": "fc9f1b9a175179a928faa51983a5ef91332190c95d5097411a0b58a2c497666b",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/fabric/tp",
+      "required_check_or_reason": "Current transport/fate handling owns broken-pair termination; validate failure and cleanup on both nodes."
+    },
+    {
+      "legacy_patch": "0021-dsv41-spill-pictures.patch",
+      "sha256": "3827f46913dc667fc18feb585a4662f883d376a30d808596b8d534409a2389f9",
+      "apply_to_mainline": false,
+      "disposition": "deferred-vision",
+      "candidate_owner": "zig/src/families/deepseek_v41/sessions_gpu.zig",
+      "required_check_or_reason": "Image-bearing cache states need separate qualification; this initial build profile is text-only."
+    },
+    {
+      "legacy_patch": "0022-dsv41-kv-shard-ring.patch",
+      "sha256": "1628d85087036dc361f7f1d9e980796195420865a3c75df9221460f6637d3dce",
+      "apply_to_mainline": false,
+      "disposition": "not-carried",
+      "candidate_owner": "zig/src/fabric/tp",
+      "required_check_or_reason": "Use current native transport, never the old ring patch; compare transport correctness/performance."
+    },
+    {
+      "legacy_patch": "0023-server-prepare-memory.patch",
+      "sha256": "2d5b73c32d039b242f9f0dadd06386fc87c910ef1cf546258345324f2dc6be36",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "Current preparation, HTTP and memory admission paths replace old server structs; long-prompt peak RAM still needs measurement."
+    },
+    {
+      "legacy_patch": "0024-mixed-pack.patch",
+      "sha256": "ad6d6642f5ee0d424f544b53b39a96cf653ea2dd366224b4e290567b5dd1ee26",
+      "apply_to_mainline": false,
+      "disposition": "revalidate",
+      "candidate_owner": "zig/src/families/deepseek_v41/cuda_format.zig",
+      "required_check_or_reason": "Mainline has its own EXL3/mixed-format planner; target EAQ v1 first, no new pack or overlay conversion."
+    },
+    {
+      "legacy_patch": "0025-widen-bf16.patch",
+      "sha256": "1d62dd21d5a8bf12b9267fb8d26cf572fce9c49e36fef8180c5f2cf4cd529675",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/plan.zig",
+      "required_check_or_reason": "Native stored-dtype rules include F16 draft heads; exact derived checkpoint still requires a real load."
+    },
+    {
+      "legacy_patch": "0026-plain-rows.patch",
+      "sha256": "776dbd47ef89f8b3e7de978443115eaa14796f1e3d7a1a167ddd7651edec0c48",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/draft/drive.zig",
+      "required_check_or_reason": "Use native draft:false as the plain oracle; compare drafted/plain tokens on hardware."
+    },
+    {
+      "legacy_patch": "0027-tool-call-prose.patch",
+      "sha256": "8a17c665af246e4b486d2b660cf1c80fcdac0d2894380933f29fc54de82cb82c",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "Current server owns DSML/content separation; verify auto tools, content and finish reasons."
+    },
+    {
+      "legacy_patch": "0028-plain-request-text.patch",
+      "sha256": "f4934702b9502545bad3d9e56542270749da69f45b2ca5bd6d57886fa0c76301",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "Current tokenizer/prompt pipeline is different; control-token spellings require a request-level regression gate."
+    },
+    {
+      "legacy_patch": "0029-anthropic-budget-default.patch",
+      "sha256": "ea7146aaf11188f9ca8fba423d18c1a37a96035b4b813258c968182384ca132f",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "Recheck Anthropic thinking defaults on the current adapter instead of applying the older patch."
+    },
+    {
+      "legacy_patch": "0030-anthropic-context-management-lenient.patch",
+      "sha256": "22eb8e2e0d9d53b4e65f0625ce703b32a5efa5b3415da0464d6f27e8ee72bd56",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "Recheck context-management edits on the current Messages adapter."
+    },
+    {
+      "legacy_patch": "0031-anthropic-system-anywhere.patch",
+      "sha256": "93be53a82a10945ab85f4ad97e9cf6ab176f0690fefec6a9dfe53c4c6edf519a",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "Recheck system-message normalization without changing the client transcript."
+    },
+    {
+      "legacy_patch": "0032-stream-keepalive-ping.patch",
+      "sha256": "ef0cc4b23f837248ec33e0d3568508e7b920593c107c57da63e2145f4c36d181",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "Verify SSE keepalive and prefill cancellation through the native server and existing proxy."
+    },
+    {
+      "legacy_patch": "0033-graph-cap.patch",
+      "sha256": "e6c1249ac2f5d7a8db9d07a8fdebdd790d4ee336e721c14b759f7da51fead8fc",
+      "apply_to_mainline": false,
+      "disposition": "blocking-parity",
+      "candidate_owner": "zig/src/families/deepseek_v41/round_graph.zig",
+      "required_check_or_reason": "The old GRAPH_CAP=128 has no verified one-to-one mapping to current round graphs; bound and measure memory."
+    },
+    {
+      "legacy_patch": "0034-rebase-followups.patch",
+      "sha256": "870e4a320b362f20d9a6b1bfc702ad2ae611edf27b3149f96210c97105447656",
+      "apply_to_mainline": false,
+      "disposition": "branch-specific",
+      "candidate_owner": "zig/src/families/deepseek_v41/index_scratch_test.zig",
+      "required_check_or_reason": "Do not replay old rebase-only offsets; current plan/alignment tests and PR3388 cover the new owner."
+    },
+    {
+      "legacy_patch": "0035-engram-lead-failure-paths.patch",
+      "sha256": "fd4c1a6597eb1312c09dd375e68c3b012a2c7d141a79f4da80ba62ce6788a7ed",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/engram_recovery_test.zig",
+      "required_check_or_reason": "Current Engram failure/recovery and allocation sweeps own cleanup; validate actual host I/O failures later."
+    },
+    {
+      "legacy_patch": "0036-metrics-cached-prompt-tokens.patch",
+      "sha256": "245bb40209faa9742890aab374c8465ae4f75a11843d396b0b7f9b0362d6adf6",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/families/deepseek_v41/serve_engine.zig",
+      "required_check_or_reason": "Validate cached prompt counters, timings and normalized discovery against our proxy/client expectations."
+    },
+    {
+      "legacy_patch": "0037-rendezvous-ports-early.patch",
+      "sha256": "b21df1a72a2faa65cb606113bdf8589046d45b9ce0b57d1b4505001e0958abbf",
+      "apply_to_mainline": false,
+      "disposition": "revalidate",
+      "candidate_owner": "zig/src/fabric/tp",
+      "required_check_or_reason": "Current rendezvous lifecycle replaces old early port opens; verify worker-before-head startup and bounded failure."
+    },
+    {
+      "legacy_patch": "0038-aligned-index-views.patch",
+      "sha256": "3bcdc7c82d88afafc6a6a15b73e464c60e5c214bf73aa3e80b4e34a117713802",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/index_scratch_test.zig",
+      "required_check_or_reason": "New buffer planner has explicit coverage tests; carry PR3388 and validate emitted GPU views."
+    },
+    {
+      "legacy_patch": "0040-restore-room.patch",
+      "sha256": "39a1eed9a04c8691ed5deb9d5ab1a7bee5c657e2aae36447eb68b2771cda8275",
+      "apply_to_mainline": false,
+      "disposition": "cache-migration",
+      "candidate_owner": "zig/src/families/deepseek_v41/sessions_gpu.zig",
+      "required_check_or_reason": "No claim that native page/session admission preserves the old prefix under pressure; test that case explicitly."
+    },
+    {
+      "legacy_patch": "0041-service-between-pieces.patch",
+      "sha256": "bced271ef216ece095bddf33d8416521877e7a067ab4130bbeadbc1b1369f7bd",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/core/lanes",
+      "required_check_or_reason": "Current lane host owns queued/parked service; validate cancellation and fair progress under long prefill."
+    },
+    {
+      "legacy_patch": "0042-kv-shard-pieces.patch",
+      "sha256": "362d7e3d41f3d8865869907bf02aabe4858f1ed597f61f1f7acae4519e9eaf6c",
+      "apply_to_mainline": false,
+      "disposition": "not-carried",
+      "candidate_owner": "zig/src/families/deepseek_v41/sched_host.zig",
+      "required_check_or_reason": "Old sharded prompt-piece integration is not applied; profile uses native unsharded pool and prompt pieces."
+    },
+    {
+      "legacy_patch": "0043-picture-resume-skip.patch",
+      "sha256": "7067c18a62c4eec224b6c431b3fe750a4bcb50f46e1dab2c8244881d52cca4c5",
+      "apply_to_mainline": false,
+      "disposition": "deferred-vision",
+      "candidate_owner": "zig/src/families/deepseek_v41/sessions_gpu.zig",
+      "required_check_or_reason": "Picture-prefix reuse is outside the initial text-only profile and remains unqualified."
+    },
+    {
+      "legacy_patch": "0045-cut-in-tail.patch",
+      "sha256": "e8ba16230e20e4cb9d6ad76252d239bbec8962605e81a0dc1beaf89581e77a7d",
+      "apply_to_mainline": false,
+      "disposition": "revalidate",
+      "candidate_owner": "zig/src/families/deepseek_v41/sched_host.zig",
+      "required_check_or_reason": "Current scheduler/retained-prefix accounting needs a cold/resumed comparison; no byte-equivalence claim."
+    },
+    {
+      "legacy_patch": "0046-server-get-delete-body-discard.patch",
+      "sha256": "ec2b571db63d4ee0135e12ab01cd912a9590865b76b78c5ff3c2acb5dacf08cc",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "Current HTTP framing/body bounds own request disposal; verify pipelined reuse without old struct patches."
+    },
+    {
+      "legacy_patch": "0047-replayed-reasoning.patch",
+      "sha256": "5650d3a504bf28811b2358a1f8193d25ed90d2c483933aa141891bf0cded0f65",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "Retain reasoning history; verify reasoning/ reasoning_content aliases through actual prompt normalization."
+    },
+    {
+      "legacy_patch": "0048-stream-tool-calls.patch",
+      "sha256": "15d531ad68a6aa839792f99bdf97660a988181651f40c3d0fcb27ba8d63f5ff9",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/families/deepseek_v41/serve/tool_stream.zig",
+      "required_check_or_reason": "Use current DSML streaming with PR3026; verify required/named/auto and split chunks."
+    },
+    {
+      "legacy_patch": "0049-first-draft-depth.patch",
+      "sha256": "8b42428c92daa6c08c92ff607fe88adbe3eabc8f8c0fbf00f03220c58c175b7a",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/draft/depth.zig",
+      "required_check_or_reason": "Current DSpark depth policy replaces the old first-draft-depth patch; verify plain equality."
+    },
+    {
+      "legacy_patch": "0050-draft-calibration.patch",
+      "sha256": "44afcf96d3644d011af9e34f3e5b1a701115e5b39e0a6b7075d316dd3998408f",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/draft/calib.zig",
+      "required_check_or_reason": "Native cost calibration is a different subsystem; legacy draft calibration weight is not forwarded."
+    },
+    {
+      "legacy_patch": "0051-prompt-rows.patch",
+      "sha256": "f19b02b298acfb835a550b1832f493ca7de6ce60151b4af293a5aedd2990f69d",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/serve_knobs.zig",
+      "required_check_or_reason": "Current prefill-row/chunk settings replace old prompt-rows controls; record resolved settings and benchmark."
+    },
+    {
+      "legacy_patch": "0056-server-picture-prepare-scratch.patch",
+      "sha256": "db2c0f387e63f88ff7e5e780cd07b20816735f193ab949264e6f41e10aaf847a",
+      "apply_to_mainline": false,
+      "disposition": "deferred-vision",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "No picture preparation/vision claim until independent model and memory qualification."
+    },
+    {
+      "legacy_patch": "0057-drop-reasoning-history.patch",
+      "sha256": "61ee2aaa825800d131394a9d54de7606969f1cafa1d32e03c7f6863575cfb0f8",
+      "apply_to_mainline": false,
+      "disposition": "policy-retained",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "Do not pass history-removal flags or mutate client messages; current rendered-history behavior must pass its API gate."
+    },
+    {
+      "legacy_patch": "0058-responses-include-encrypted.patch",
+      "sha256": "275bb9bf0264cbeadf262b8ff990c92946b0f4d7aafd2c624d20393aabbd71b9",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/server",
+      "required_check_or_reason": "Recheck Responses include=reasoning.encrypted_content behavior; no legacy parser patch applied."
+    },
+    {
+      "legacy_patch": "0059-lane-thread-binds-context.patch",
+      "sha256": "83bf880ff14ee72d92de79f176856c793c5d00ca87d40c9a5459ef560bc4fb9f",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/serve_engine.zig",
+      "required_check_or_reason": "Current lane host binds the CUDA context via on_thread; host build covers type integration, device test still needed."
+    },
+    {
+      "legacy_patch": "0064-dsml-opener-short-payload.patch",
+      "sha256": "10153916fda2c3335adc2ccadad3317ec241fa27f2c9494712d0f04250d45b68",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/families/deepseek_v41/serve/tool_scan.zig",
+      "required_check_or_reason": "Current DSML scanner replaces old parser; short/truncated-block regression must pass."
+    },
+    {
+      "legacy_patch": "0065-dsml-value-holds-closer.patch",
+      "sha256": "4a6592555e638d433e9c40fc5eebfc8593bd64eda46a6b3f8da83c6f11f52ebe",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/families/deepseek_v41/serve/tool_scan.zig",
+      "required_check_or_reason": "Value-containing-closer cases require current parser goldens; not assumed fixed by a filename match."
+    },
+    {
+      "legacy_patch": "0066-load-prefetch.patch",
+      "sha256": "e19ffe3272a64a6c0cdecc2ea4bf53edfc7ee5638d1c0b41720f2a2ab7883dd0",
+      "apply_to_mainline": false,
+      "disposition": "new-owner",
+      "candidate_owner": "zig/src/families/deepseek_v41/cuda_load_prefetch.zig",
+      "required_check_or_reason": "Use current loader and a new prepared cache; never treat legacy rank-cache bytes as native prepared images."
+    },
+    {
+      "legacy_patch": "0067-orphan-dsml-closer-diagnostic.patch",
+      "sha256": "93f1b878d18206fbd15e440d05ec7f036d68ffecbce8d5d6a4a923b58d31c0c6",
+      "apply_to_mainline": false,
+      "disposition": "api-gate",
+      "candidate_owner": "zig/src/families/deepseek_v41/serve/tool_scan.zig",
+      "required_check_or_reason": "Verify orphan DSML closer diagnostics and empty-call handling with real streamed/buffered requests."
+    },
+    {
+      "legacy_patch": "0068-rdma-proxy-cpus.patch",
+      "sha256": "20c0c3b04596acc1a02a5e5ab9506ec7547854c98a6c57fda43cdea6174532fe",
+      "apply_to_mainline": false,
+      "disposition": "revalidate",
+      "candidate_owner": "zig/src/fabric/tp",
+      "required_check_or_reason": "Old TF_DS_RDMA_CPUS is not forwarded; native transport affinity must be selected from its own supported settings."
+    }
+  ],
+  "deployed_local_fixes": [
+    {
+      "patch": "long-loop guard",
+      "disposition": "already upstream",
+      "evidence": "zig/src/core/lanes/long_loop.zig",
+      "action": "Use --loop-guard; do not apply our old backport."
+    },
+    {
+      "patch": "first-token/opener correction",
+      "disposition": "different implementation",
+      "evidence": "PR3026 and shared lane grammar hooks",
+      "action": "Use current masked first-token path and verify required/named tool cases."
+    },
+    {
+      "patch": "long-prefix preservation",
+      "disposition": "parity gate",
+      "evidence": "zig/src/families/deepseek_v41/sessions_gpu.zig",
+      "action": "Repeat retained-prefix-under-pressure reproduction against native pool."
+    },
+    {
+      "patch": "cache TTL and memory floor",
+      "disposition": "blocking parity gap",
+      "evidence": "zig/src/families/deepseek_v41/sessions_gpu.zig",
+      "action": "No mapping to legacy spill-v2; port/test native policy before enabling persistent disk cache."
+    },
+    {
+      "patch": "reasoning-history regression tests",
+      "disposition": "policy retained, API gate pending",
+      "evidence": "zig/src/server",
+      "action": "Retain all reasoning history and verify rendered prompts with current server."
+    }
+  ],
+  "equivalence_claim": "Owner mapping is not proof of semantic or token equivalence. Every API/device/parity gate remains explicit.",
+  "source_mutations": "Only the two pinned existing upstream PR diffs are applied; no competing engine fix is authored."
+}

@@ -1,0 +1,53 @@
+{
+  "status": "CPU source/build preparation passed; no CUDA image or GPU qualification claimed",
+  "tensorfold": "2ba55ec7d32d0bec446bb012678550be7ef52895",
+  "patches": [
+    "72b14dc2ea93a6c548b2490646655f92d17743ad289f4d614cbd87cbb53f96b4",
+    "7031c2511e9001d877f171d9e00a36c7621a20f2774a5ce5927b53fb70b41971"
+  ],
+  "cpu_builder": "python@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df",
+  "compiler_sha256": "5165c9a2d17938a8173839b3adf81d025b558d38d9e9711237a6fa5b8d8bb3f7",
+  "command": [
+    "zig",
+    "build",
+    "-j2",
+    "dsv41-assets",
+    "test-dsv41-assets-host",
+    "test-dsv41-token-map",
+    "test-dsv41-draft",
+    "test-dsv41-forward",
+    "--summary",
+    "all"
+  ],
+  "exit_code": 0,
+  "summary": "29/29 steps succeeded; 345/346 tests passed (1 skipped)",
+  "host_log_sha256": "59d5f54ce6eddfdd7b747c2c2a4f871ae4b81c38de3250972b6e2c49d66e7b57",
+  "migration_safety_tests": {
+    "passed": 6,
+    "failed": 0
+  },
+  "tools": {
+    "tf-dsv41-assets": {
+      "sha256": "7e168d64b18c4afc28263c40f96817deb718b0cd762c1a1dc2364de394668bc0",
+      "bytes": 6716024
+    },
+    "tf-dsv41-token-map": {
+      "sha256": "2a41f1193f6457eb50b6150bf6c1a57596788f7a58b4fe983f2d588c4aa475d5",
+      "bytes": 5613424
+    }
+  },
+  "production_operations": [],
+  "unrun": [
+    "CUDA/NVCC image build",
+    "Real-checkpoint token map, RoPE, AOT and packed Engram generation",
+    "Independent GPU correctness/concurrency/cache-recovery/performance",
+    "Persistent cache policy parity and graph memory bounds",
+    "Vision"
+  ],
+  "dockerfile_check": {
+    "command": "docker build --check mainline/data/context",
+    "exit_code": 0,
+    "result": "Check complete, no warnings found; metadata only, no CUDA image build"
+  },
+  "compiler_url_http": 200
+}

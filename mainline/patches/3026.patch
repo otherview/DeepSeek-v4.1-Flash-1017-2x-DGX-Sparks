@@ -1,0 +1,2234 @@
+diff --git a/.github/workflows/no-gpu.yml b/.github/workflows/no-gpu.yml
+index 60f93b846d8..a5fe88fd08a 100644
+--- a/.github/workflows/no-gpu.yml
++++ b/.github/workflows/no-gpu.yml
+@@ -145,6 +145,9 @@ jobs:
+       # Keep per-test timeouts while allowing the DeepSeek AOT enumeration to finish on hosted runners.
+       - name: zig build test-host
+         run: zig build -Dfixed-cpu test-host --test-timeout 20m
++      # DeepSeek-V4.1's keyed sampling, DSpark and shared lane core host tests. Its row and device plans run nightly.
++      - name: zig build test-dsv41-draft
++        run: zig build -Dfixed-cpu test-dsv41-draft --test-timeout 10m
+       # The kernel contract's limits gate: every registered launch against M1-M5 and sm_80/86/89/120/121, controls red.
+       - name: zig build test-kernel-contract
+         run: zig build -Dfixed-cpu test-kernel-contract
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index a6c4c732909..ed8fd16600e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,10 @@
+ 
+ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
+ 
++## Unreleased
++
++- DeepSeek-V4.1 on CUDA: structured output and required or named tool calls use the shared lane grammar masks with drafting; the existing whole-model admission gate is unchanged (#3026, fixes #1664). Thanks to @nuk3s.
++
+ ## 1.2.9
+ 
+ - Tests: the sessions writes test on real files does the same coverage with 40 requests at half the token sizes, so it no longer times out on busy CI runners (#3347).
+diff --git a/docs/api.md b/docs/api.md
+index f62e7151f9b..a7b36e8609e 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -448,7 +448,9 @@ On CUDA, stop strings are checked after every token on the generated text, reaso
+ completes the match. The GLM engine, and Flash Next and Nemotron on two ranks, decode on after a match to an end
+ token or the reply limit; the server returns the reply only up to the match. Where a CUDA engine honors
+ `ignore_eos`, end tokens inside the reply are decoded into its text, as on MLX, and `finish_reason` is `length`
+-unless a stop string or a tool call ended the reply.
++unless a stop string, a tool call or a grammar ended the reply. A grammar's stop token is an end token, and with
++`ignore_eos` it still ends the reply with `finish_reason` `stop` and stays out of the text. End tokens in the
++reasoning, before the grammar starts, stay in it.
+ 
+ ### Exact incremental token IDs
+ 
+@@ -689,7 +691,11 @@ are the same.
+ On the native server, `/v1/chat/completions` and `/v1/responses` enforce `tool_choice: "required"` and a named
+ function with the engine's token grammar. Chat uses `{"type":"function","function":{"name":"lookup"}}`;
+ Responses uses `{"type":"function","name":"lookup"}`. Only offered tools are allowed; an unknown name or a required
+-call with no tools gets HTTP 400. `auto` remains optional, and `none` hides the tools.
++call with no tools gets HTTP 400. `auto` remains optional, and `none` hides the tools. With `auto`, a request that
++offers a tool marked `"strict": true` gets an optional grammar on an engine with token grammar support: the reply is
++free text or calls, and a strict tool's arguments follow its parameter schema. `TENSORFOLD_TOOL_GRAMMAR=1` holds every
++offered tool this way. An engine without that support runs these requests unconstrained. DeepSeek-V4.1 on CUDA has
++it, so its strict tools under `auto` are constrained like the other families'.
+ 
+ The constrained answer contains one or more complete calls and no prose outside them. Arguments follow the offered
+ parameter schema. GLM uses `<arg_key>` and `<arg_value>` tags after the function name.
+@@ -713,6 +719,8 @@ The server does not silently turn a required call into `auto`. Installing the gr
+ backend mask hook. A missing library or grammar compilation error is also refused before generation with its reason.
+ 
+ The native GLM CUDA backend also supports token grammars, gathering vocabulary rows before rank 0 masks and draws.
++DeepSeek-V4.1 on CUDA (`dsv41-cuda`, a source build) supports them too: rank 0 sends each pick's grammar rows to the
++other ranks, and every rank masks its own vocabulary columns before the pick.
+ 
+ `grammar_budget: true` (native server, off by default) keeps a constrained reply completable within its token limit, so
+ a required tool call or a JSON value cut by `max_tokens` still parses. Before each draw, a token is masked when no
+diff --git a/zig/src/families/deepseek_v41/batch_target.zig b/zig/src/families/deepseek_v41/batch_target.zig
+index 0f1b5f0072b..8b36671f4b2 100644
+--- a/zig/src/families/deepseek_v41/batch_target.zig
++++ b/zig/src/families/deepseek_v41/batch_target.zig
+@@ -4,14 +4,18 @@ const rowtab = @import("rowtab.zig");
+ const iface = @import("draft/iface.zig");
+ const samp = @import("sampling_gpu.zig");
+ const batch = @import("batch.zig");
++const gg = @import("grammar_gpu.zig");
+ const Batch = batch.Batch;
+ 
+ /// Target.window: the segments as one round (several forwards past the cap); each row's greedy or keyed choice.
+-pub fn targetWindow(b: *Batch, segments: []const iface.Segment, choices: [][]u32, sampler: ?*samp.GpuSampler) !void {
++pub fn targetWindow(b: *Batch, segments: []const iface.Segment, choices: [][]u32, sampler: ?*samp.GpuSampler, grammar: ?*gg.Masks) !void {
+     if (segments.len == 0 or segments.len > 16) return error.Slots;
+     var mix: [16]rowtab.Seg = undefined;
++    var masked: [gg.max_rows]gg.Row = undefined;
+     for (segments, mix[0..segments.len]) |sg, *m| {
+         if (sg.parents != null) return error.TreeWindow;
++        // structured output: each segment's bits checked before the first forward goes out
++        if ((try gg.segmentRows(&masked, &.{sg})).len > 0 and grammar == null) return error.StructuresUnsupported;
+         if (samp.sampled(sg.sampling) and sampler == null) return error.Sampling;
+         if (sg.slot >= b.ss.n) return error.Slots;
+         // a pending window must end where the segment starts (a chain never kept keeps every row)
+@@ -28,6 +32,7 @@ pub fn targetWindow(b: *Batch, segments: []const iface.Segment, choices: [][]u32
+             @memcpy(ids[n..][0..sg.tokens.len], sg.tokens);
+             n += sg.tokens.len;
+         }
++        if (grammar) |g| try g.stage(try gg.segmentRows(&masked, segments[rg[0]..rg[1]]));
+         try b.window(mix[rg[0]..rg[1]], ids[0..n], j > 0);
+         var greedy_rows = false;
+         for (segments[rg[0]..rg[1]]) |sg| greedy_rows = greedy_rows or !samp.sampled(sg.sampling);
+diff --git a/zig/src/families/deepseek_v41/cuda_model.zig b/zig/src/families/deepseek_v41/cuda_model.zig
+index e4304af86f7..c711c2da846 100644
+--- a/zig/src/families/deepseek_v41/cuda_model.zig
++++ b/zig/src/families/deepseek_v41/cuda_model.zig
+@@ -30,6 +30,7 @@ const sg = @import("sessions_gpu.zig");
+ const slots_mod = @import("slots.zig");
+ const batch = @import("batch.zig");
+ const samp = @import("sampling_gpu.zig");
++const gg = @import("grammar_gpu.zig");
+ const dspark_rows = @import("dspark_rows.zig");
+ const dspark_slots = @import("dspark_slots.zig");
+ const l2pf_mod = @import("l2pf.zig");
+@@ -116,6 +117,8 @@ pub const Model = struct {
+     slot_pass: ?*dspark_slots.SlotPass = null,
+     /// the keyed sampler, every rank with TF_DSV41_SAMPLING=1 (requests with T > 0; followers run its gathers)
+     sampler: ?*samp.GpuSampler = null,
++    /// structured output's masks, every rank (rank 0 stages each pick's grammar rows; followers mask what it sends)
++    grammar: ?*gg.Masks = null,
+     /// TF_DSV41_L2PF (l2pf.zig): the filled prefetch tables and the runner's side stream
+     l2pf: ?*l2pf_mod.L2pf = null,
+ 
+@@ -156,6 +159,7 @@ pub const Model = struct {
+         m.rows = null;
+         m.slot_pass = null;
+         m.sampler = null;
++        m.grammar = null;
+         m.dev_arena = null;
+         m.supervisor = null;
+         m.arena = std.heap.ArenaAllocator.init(gpa);
+@@ -433,6 +437,8 @@ pub const Model = struct {
+         // TF_DSV41_SAMPLING=1: keyed sampling (T > 0) on every rank; off: such requests are refused (error.Sampling)
+         m.sampler = if ((try samp.enabled())) try samp.GpuSampler.init(gpa, &m.f) else null;
+         m.gt.sampler = m.sampler;
++        m.grammar = try gg.Masks.init(gpa, &m.f);
++        m.gt.grammar = m.grammar;
+         try m.driver.synchronize();
+         tr.step("end", cuda.usage(false));
+         tr.trim();
+@@ -511,6 +517,7 @@ pub const Model = struct {
+         if (m.slot_set) |ss| ss.deinit();
+         if (m.pass) |p| p.deinit();
+         if (m.sampler) |x| x.deinit();
++        if (m.grammar) |x| x.deinit();
+         if (m.sessions) |x| x.deinitAfterDrain();
+         if (m.f.kv) |k| k.deinitAfterDrain();
+         m.f.deinitAfterDrain();
+diff --git a/zig/src/families/deepseek_v41/device_host_test.zig b/zig/src/families/deepseek_v41/device_host_test.zig
+index c38e0dcdcd8..53041891d02 100644
+--- a/zig/src/families/deepseek_v41/device_host_test.zig
++++ b/zig/src/families/deepseek_v41/device_host_test.zig
+@@ -5,7 +5,7 @@ test {
+     _ = @import("serve_cli.zig");
+     if (@import("builtin").os.tag == .linux) inline for (.{ @import("cuda_model.zig").Model, @import("serve_engine.zig").Served, @import("serve_cli.zig") }) |m| std.testing.refAllDecls(m);
+     _ = @import("slot_transactions_test.zig");
+-    inline for (.{ @import("target.zig").GpuTarget, @import("batch.zig").Batch, @import("sampling_gpu.zig").GpuSampler, @import("sampling_dev.zig").Gpu, @import("dspark_gpu.zig").GpuPass, @import("dspark_slots.zig").SlotPass, @import("dspark_dev.zig").Dev, @import("sched_host.zig"), @import("phases_timed.zig"), @import("profile.zig"), @import("aot_needs.zig") }) |m| std.testing.refAllDecls(m);
++    inline for (.{ @import("target.zig").GpuTarget, @import("batch.zig").Batch, @import("sampling_gpu.zig").GpuSampler, @import("grammar_gpu.zig").Masks, @import("sampling_dev.zig").Gpu, @import("dspark_gpu.zig").GpuPass, @import("dspark_slots.zig").SlotPass, @import("dspark_dev.zig").Dev, @import("sched_host.zig"), @import("phases_timed.zig"), @import("profile.zig"), @import("aot_needs.zig") }) |m| std.testing.refAllDecls(m);
+     _ = @import("rows_test.zig");
+     _ = @import("slot_drafts_test.zig");
+     _ = @import("slot_drafts_chain_test.zig");
+@@ -13,6 +13,7 @@ test {
+     _ = @import("branches_test.zig");
+     _ = @import("aot_needs_test.zig");
+     _ = @import("kx_early_test.zig");
++    _ = @import("grammar_gpu_test.zig");
+ }
+ 
+ test {
+diff --git a/zig/src/families/deepseek_v41/draft/draft.zig b/zig/src/families/deepseek_v41/draft/draft.zig
+index 78f48ed0ae2..0ae2ca02c8e 100644
+--- a/zig/src/families/deepseek_v41/draft/draft.zig
++++ b/zig/src/families/deepseek_v41/draft/draft.zig
+@@ -46,6 +46,8 @@ test {
+     _ = @import("branches_test.zig");
+     _ = @import("drive_test.zig");
+     _ = @import("lanes_test.zig");
++    _ = @import("lanes_grammar_test.zig");
++    _ = @import("lanes_first_test.zig");
+     _ = @import("golden_test.zig");
+     _ = spec;
+     _ = @import("spec_test.zig");
+diff --git a/zig/src/families/deepseek_v41/draft/iface.zig b/zig/src/families/deepseek_v41/draft/iface.zig
+index d63cae1b376..517eacb8d71 100644
+--- a/zig/src/families/deepseek_v41/draft/iface.zig
++++ b/zig/src/families/deepseek_v41/draft/iface.zig
+@@ -11,6 +11,7 @@ pub const Segment = struct {
+     parents: ?[]const i32, // each row's parent row (row 0: -1); null: a chain
+     draws: []const u64,
+     sampling: ?lanes.Sampling,
++    masks: []const u32 = &.{}, // structured output: each row's allowed bits (rows x words, lanes/grammar.zig); empty: none
+ };
+ 
+ /// A slot's last rows' taps (bf16 [rows, 3 x hidden] at `address`); `map`: tree window row -> taps row (branches.zig).
+@@ -46,6 +47,8 @@ pub const Target = struct {
+         replays: ?*const fn (ptr: *anyopaque, list: []const Final) anyerror!void = null,
+         /// Engram reads ahead of the next window (TF_DSV41_ENGRAM_WARM); reads only, window bits are unaffected.
+         warm: ?*const fn (ptr: *anyopaque, asks: []const Warm) void = null,
++        /// Before prompt completion: the first token's allowed bits; empty means no grammar.
++        first_mask: ?*const fn (ptr: *anyopaque, slot: u32, bits: []const u32) void = null,
+         /// After `prefill`: the prompt rows the slot took from kept state (its first row computed is this one).
+         resumed: ?*const fn (ptr: *anyopaque, slot: u32) u64 = null,
+         /// Committed rows' taps for positions [start, start + rows), in order; null: not kept. null fn: none kept.
+@@ -82,6 +85,17 @@ pub const Target = struct {
+         if (t.vtable.admit) |f| f(t.ptr, slot, max_new);
+     }
+ 
++    /// Whether the target draws rows among their grammar's tokens (`first_mask`, Segment.masks).
++    pub fn masks(t: Target) bool {
++        return t.vtable.first_mask != null;
++    }
++
++    /// The slot's next first token's bits; error.StructuresUnsupported when the target takes no masks.
++    pub fn firstMask(t: Target, slot: u32, bits: []const u32) !void {
++        const f = t.vtable.first_mask orelse return if (bits.len > 0) error.StructuresUnsupported else {};
++        f(t.ptr, slot, bits);
++    }
++
+     pub fn pieces(t: Target) bool {
+         return t.vtable.begin != null and t.vtable.piece != null and t.vtable.finish != null;
+     }
+diff --git a/zig/src/families/deepseek_v41/draft/lane_owner.zig b/zig/src/families/deepseek_v41/draft/lane_owner.zig
+index d0957002833..e5188154105 100644
+--- a/zig/src/families/deepseek_v41/draft/lane_owner.zig
++++ b/zig/src/families/deepseek_v41/draft/lane_owner.zig
+@@ -42,10 +42,7 @@ pub fn init(gpa: std.mem.Allocator, target: iface.Target, pass: iface.Pass, pric
+     return x;
+ }
+ pub fn deinit(x: *ln.Lanes) void {
+-    for (x.by_slot) |st| if (st) |owner| {
+-        owner.shown.deinit(x.gpa);
+-        x.gpa.destroy(owner);
+-    };
++    for (x.by_slot) |st| if (st) |owner| x.drop(owner);
+     x.streams.deinit(x.gpa);
+     x.free.deinit(x.gpa);
+     x.drawn.deinit(x.gpa);
+diff --git a/zig/src/families/deepseek_v41/draft/lanes.zig b/zig/src/families/deepseek_v41/draft/lanes.zig
+index 70d176a0656..c835736574e 100644
+--- a/zig/src/families/deepseek_v41/draft/lanes.zig
++++ b/zig/src/families/deepseek_v41/draft/lanes.zig
+@@ -12,6 +12,7 @@ const calib = @import("calib.zig");
+ const costs_mod = @import("costs.zig");
+ const Policy = @import("policy.zig").Policy;
+ const spec_mod = @import("spec.zig");
++const first_mask = @import("lanes_first.zig");
+ 
+ pub const max_block = 16;
+ 
+@@ -32,6 +33,7 @@ pub const St = struct {
+     len: u64 = 0, // rows the target holds (provisional after a window until keep)
+     base: u64 = 0, // the last window's start
+     first: u32 = 0, // the prompt's choice (for `first`)
++    first_bits: std.ArrayList(u32) = .empty, // the grammar bits the pass drew `first` under (lanes_first.zig)
+     held: [max_block]u32 = undefined, // the last pass's drafts (the main chain)
+     conf: [max_block]f64 = undefined,
+     n: u32 = 0, // drafts held (0: none this round)
+@@ -78,6 +80,7 @@ pub const Lanes = struct {
+ 
+     pub fn drop(x: *Lanes, st: *St) void {
+         st.shown.deinit(x.gpa);
++        st.first_bits.deinit(x.gpa);
+         x.gpa.destroy(st);
+     }
+ 
+@@ -86,7 +89,7 @@ pub const Lanes = struct {
+         return .{ .ptr = x, .vtable = if (pieces) &vtable_pieces else &vtable };
+     }
+ 
+-    const vtable: be.Backend.VTable = .{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .probabilities = probabilities, .tree = heldTree, .release = release };
++    const vtable: be.Backend.VTable = .{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .probabilities = probabilities, .tree = heldTree, .held = heldChain, .release = release, .first_masked = firstMasked };
+     /// a target that runs prompts in pieces (iface.Target begin / piece / finish): the round planner may use them
+     const vtable_pieces: be.Backend.VTable = blk: {
+         var v = vtable;
+@@ -174,6 +177,7 @@ pub const Lanes = struct {
+         x.policy.depth.reset(slot);
+         const ids = s.prompt();
+         x.target.admit(slot, s.max_new);
++        try x.target.firstMask(slot, try first_mask.take(x, st, s));
+         st.first = try x.target.prefill(slot, ids, s.sampling, ids.len);
+         s.cached = @intCast(x.target.resumedRows(slot));
+         st.len = ids.len;
+@@ -250,6 +254,7 @@ pub const Lanes = struct {
+         const st = try x.get(s);
+         try x.settle();
+         const ids = s.prompt();
++        try x.target.firstMask(st.slot, try first_mask.take(x, st, s));
+         return x.finished(st, ids, try x.target.finish(st.slot, ids, s.sampling, ids.len));
+     }
+ 
+@@ -259,6 +264,7 @@ pub const Lanes = struct {
+         const st = try x.get(s);
+         try x.settle();
+         const ids = s.prompt();
++        try x.target.firstMask(st.slot, try first_mask.take(x, st, s));
+         if (try x.target.tail(st.slot, ids, s.sampling, ids.len)) |first_| {
+             try x.finished(st, ids, first_);
+             return false;
+@@ -286,6 +292,12 @@ pub const Lanes = struct {
+         return x.drawn.items.len - 1;
+     }
+ 
++    /// Backend.first_masked: `first`, the pass's pick under these same bits; no forward, KV row or draft runs.
++    fn firstMasked(ptr: *anyopaque, s: *Stream, position: u64, mask: []const u32) anyerror!u64 {
++        try first_mask.check(try self(ptr).get(s), mask);
++        return first(ptr, s, position);
++    }
++
+     fn queue(ptr: *anyopaque, s: *Stream, feed: be.Feed, position: u64) anyerror!u64 {
+         const x = self(ptr);
+         const st = try x.get(s);
+@@ -323,7 +335,8 @@ pub const Lanes = struct {
+             @memcpy(tokens[1 .. 1 + w.held], st.held[0..w.held]);
+             @memcpy(tokens[1 + w.held ..], w.tokens);
+             const parents = w.parents; // each row's parent row (row 0: -1)
+-            g.* = .{ .slot = st.slot, .start = st.len, .tokens = tokens, .parents = parents, .draws = w.positions, .sampling = w.stream.sampling };
++            if (w.masks.len > 0 and !x.target.masks()) return error.StructuresUnsupported;
++            g.* = .{ .slot = st.slot, .start = st.len, .tokens = tokens, .parents = parents, .draws = w.positions, .sampling = w.stream.sampling, .masks = w.masks };
+             c.* = o.sampled;
+             @memcpy(o.drafts, tokens[1..]);
+         }
+@@ -545,6 +558,13 @@ pub const Lanes = struct {
+         return .{ .count = total, .tokens = tokens, .parents = parents };
+     }
+ 
++    /// Backend.held: the held chain's drafts as host tokens, the ones `verify` puts in a window's held rows.
++    fn heldChain(ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void {
++        const st = try self(ptr).get(s);
++        if (out.len > st.n) return error.HeldMismatch;
++        @memcpy(out, st.held[0..out.len]);
++    }
++
+     /// Each held draft's chance of landing from the raw confidences (the engine's own allocation, without the policy).
+     fn probabilities(ptr: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
+         const x = self(ptr);
+diff --git a/zig/src/families/deepseek_v41/draft/lanes_first.zig b/zig/src/families/deepseek_v41/draft/lanes_first.zig
+new file mode 100644
+index 00000000000..6b298cbc0ed
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/draft/lanes_first.zig
+@@ -0,0 +1,21 @@
++//! A grammar stream's first token: the prompt pass draws it among the bits that Backend.first_masked is then given.
++const std = @import("std");
++const lanes = @import("lanes");
++const Stream = lanes.Stream;
++const ln = @import("lanes.zig");
++
++/// Before `prefill`, `finish` or `join`: the grammar's first-token bits, kept in `st` for the target (empty: none).
++pub fn take(x: *ln.Lanes, st: *ln.St, s: *Stream) ![]const u32 {
++    st.first_bits.clearRetainingCapacity();
++    const g = s.grammar orelse return &.{};
++    // Constraint.next: the same bits Engine.drawFirst asks for after the pass; the grammar takes no token in between
++    const bits = (try g.next(x.scratch.allocator())) orelse return &.{};
++    try st.first_bits.appendSlice(x.gpa, bits);
++    return st.first_bits.items;
++}
++
++/// Backend.first_masked's guarantee: `mask` is the bits the pass drew the pick under, and the pick is among them.
++pub fn check(st: *const ln.St, mask: []const u32) !void {
++    if (!std.mem.eql(u32, mask, st.first_bits.items)) return error.FirstMaskChanged;
++    if (!lanes.grammar.allows(mask, st.first)) return error.FirstNotMasked;
++}
+diff --git a/zig/src/families/deepseek_v41/draft/lanes_first_test.zig b/zig/src/families/deepseek_v41/draft/lanes_first_test.zig
+new file mode 100644
+index 00000000000..7bb4ea44e05
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/draft/lanes_first_test.zig
+@@ -0,0 +1,338 @@
++//! Backend.first_masked on DeepSeek's lanes: the prompt pass draws the first token under the bits it is later given.
++const std = @import("std");
++const lanes = @import("lanes");
++const twin = @import("twin.zig");
++const iface = @import("iface.zig");
++const ln = @import("lanes.zig");
++const servedCosts = @import("lanes_test.zig").servedCosts;
++const gt = @import("lanes_grammar_test.zig");
++
++const gpa = std.testing.allocator;
++const grammar = lanes.grammar;
++const Steps = gt.Steps;
++const Case = gt.Case;
++
++/// The twin with prompts as the GPU target runs them: a prefix in place, rows in pieces, then the last row alone.
++const Pieces = struct {
++    t: *twin.Twin,
++    pass: iface.Pass,
++    cached: u64 = 0, // rows `begin` puts in place before the pieces, as a prompt cache hit does (run again here)
++    ran_tail: bool = false, // `tail` runs the last row anyway and returns its pick (Lanes.join then returns false)
++    drop_bits: bool = false, // a broken target: it draws the prompt's pick without the slot's first bits
++    bits: [8][]const u32 = @splat(&.{}), // each slot's first-token bits (Target.first_mask)
++
++    fn target(p: *Pieces) iface.Target {
++        return .{ .ptr = p, .vtable = &.{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .first_mask = firstMask, .begin = begin, .piece = piece, .finish = finish, .tail = tail } };
++    }
++
++    fn cast(ptr: *anyopaque) *Pieces {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn inner(ptr: *anyopaque) iface.Target {
++        return cast(ptr).t.target();
++    }
++
++    fn firstMask(ptr: *anyopaque, slot: u32, bits: []const u32) void {
++        cast(ptr).bits[slot] = bits;
++    }
++
++    /// The slot's first bits, once (GpuTarget.takeFirst).
++    fn take(p: *Pieces, slot: u32) []const u32 {
++        defer p.bits[slot] = &.{};
++        return if (p.drop_bits) &.{} else p.bits[slot];
++    }
++
++    fn prefill(ptr: *anyopaque, slot: u32, ids: []const u32, smp: ?lanes.Sampling, draw: u64) anyerror!u32 {
++        try inner(ptr).firstMask(slot, cast(ptr).take(slot));
++        return inner(ptr).prefill(slot, ids, smp, draw);
++    }
++
++    fn window(ptr: *anyopaque, segments: []const iface.Segment, choices: [][]u32) anyerror!void {
++        return inner(ptr).window(segments, choices);
++    }
++
++    fn keep(ptr: *anyopaque, slot: u32, path: []const u32) anyerror!void {
++        return inner(ptr).keep(slot, path);
++    }
++
++    fn taps(ptr: *anyopaque, slot: u32) iface.Taps {
++        return inner(ptr).taps(slot);
++    }
++
++    fn release(ptr: *anyopaque, slot: u32) void {
++        inner(ptr).release(slot);
++    }
++
++    /// Prompt rows [start, end): the slot's first rows prefill, later ones run as a window; their taps go to the pass.
++    fn run(p: *Pieces, slot: u32, ids: []const u32, start: u64, end: u64) !void {
++        const t = p.t.target();
++        const n: usize = @intCast(end - start);
++        if (start == 0) {
++            _ = try t.prefill(slot, ids[0..n], null, end);
++        } else {
++            var draws: [64]u64 = undefined;
++            for (draws[0..n], 0..) |*w, i| w.* = start + i + 1;
++            var out: [64]u32 = undefined;
++            var rows = [_][]u32{out[0..n]};
++            try t.window(&.{.{ .slot = slot, .start = start, .tokens = ids[@intCast(start)..@intCast(end)], .parents = null, .draws = draws[0..n], .sampling = null }}, &rows);
++        }
++        const tp = t.taps(slot);
++        var at: [64]u32 = undefined;
++        for (at[0..tp.rows], 0..) |*r, i| r.* = @intCast(i);
++        try p.pass.ingest(slot, start, tp, at[0..tp.rows]);
++    }
++
++    fn begin(ptr: *anyopaque, slot: u32, ids: []const u32) anyerror!iface.Target.Begun {
++        const p = cast(ptr);
++        if (p.cached > 0) try p.run(slot, ids, 0, p.cached);
++        return .{ .at = p.cached };
++    }
++
++    fn piece(ptr: *anyopaque, slot: u32, ids: []const u32, start: u64, end: u64, _: bool) anyerror!void {
++        return cast(ptr).run(slot, ids, start, end);
++    }
++
++    /// The prompt's last row as its own window, drawn under the slot's first bits (GpuTarget.finish).
++    fn last(p: *Pieces, slot: u32, ids: []const u32, smp: ?lanes.Sampling, draw: u64) !u32 {
++        const bits = p.take(slot);
++        var one: [1]u32 = undefined;
++        var out = [_][]u32{&one};
++        try p.t.target().window(&.{.{ .slot = slot, .start = ids.len - 1, .tokens = ids[ids.len - 1 ..], .parents = null, .draws = &.{draw}, .sampling = smp, .masks = bits }}, &out);
++        return one[0];
++    }
++
++    fn finish(ptr: *anyopaque, slot: u32, ids: []const u32, smp: ?lanes.Sampling, draw: u64) anyerror!u32 {
++        return cast(ptr).last(slot, ids, smp, draw);
++    }
++
++    fn tail(ptr: *anyopaque, slot: u32, ids: []const u32, smp: ?lanes.Sampling, draw: u64) anyerror!?u32 {
++        const p = cast(ptr);
++        if (p.ran_tail) return try p.last(slot, ids, smp, draw);
++        _ = p.take(slot); // the first token comes from the round's window, its bits the lane core's
++        return null;
++    }
++};
++
++/// A prompt's way to its first token; joined: its first round draws it, tail: the target runs the tail row anyway.
++const Path = enum { whole, pieces, cached, joined, tail };
++
++/// What the prompt pass left: the slot's KV rows and taps, the drafter's rings, and the lanes' state for the stream.
++const Seen = struct {
++    first: u32 = 0,
++    kv: []f32,
++    taps: []f32,
++    ring: []f32,
++    tags: []i64,
++    st: [4]u64,
++
++    fn take(t: *twin.Twin, d: *twin.Drafter, x: *ln.Lanes, s: *lanes.Stream) !Seen {
++        const sl = &t.slots[0];
++        const st = x.state(s).?;
++        return .{ .kv = try std.mem.concat(gpa, f32, &.{ sl.k.items, sl.v.items }), .taps = try gpa.dupe(f32, sl.taps.items), .ring = try gpa.dupe(f32, d.rings[0]), .tags = try gpa.dupe(i64, d.tags[0]), .st = .{ st.len, st.base, st.n, x.drawn.items.len } };
++    }
++
++    fn deinit(v: Seen) void {
++        gpa.free(v.kv);
++        gpa.free(v.taps);
++        gpa.free(v.ring);
++        gpa.free(v.tags);
++    }
++
++    /// The same KV rows, taps and drafter rings; `lanes`: the same lanes state too (one handle more after a draw).
++    fn expectSame(a: Seen, b: Seen, lanes_: bool) !void {
++        try std.testing.expectEqualSlices(f32, a.kv, b.kv);
++        try std.testing.expectEqualSlices(f32, a.taps, b.taps);
++        try std.testing.expectEqualSlices(f32, a.ring, b.ring);
++        try std.testing.expectEqualSlices(i64, a.tags, b.tags);
++        if (lanes_) try std.testing.expectEqualSlices(u64, a.st[0..3], b.st[0..3]);
++    }
++};
++
++/// The case's prompt pass on `path`, then the first draw as Engine.drawFirst makes it; `masked`: under the grammar.
++fn probe(cs: Case, path: Path, masked: bool) !Seen {
++    const t = try twin.Twin.init(gpa, .{}, 2);
++    defer t.deinit();
++    const d = try twin.Drafter.init(gpa, t, 2);
++    defer d.deinit();
++    var p: Pieces = .{ .t = t, .pass = d.pass(), .cached = if (path == .cached) 4 else 0, .ran_tail = path == .tail };
++    var c = try servedCosts(gpa);
++    defer c.deinit(gpa);
++    const x = try ln.Lanes.init(gpa, if (path == .whole) t.target() else p.target(), d.pass(), c, .{ .shape = d.shape, .slots = 1 });
++    defer x.deinit();
++    var g: Steps = .{ .length = cs.length, .r = cs.r };
++    var k: grammar.Constraint = .init(g.rules(), Steps.words, null);
++    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = cs.prompt, .max_new = cs.length + 8, .sampling = cs.sampling, .grammar = if (masked) &k else null });
++    defer s.deinit(gpa);
++    const b = x.backend();
++    if (path == .whole) try b.prefill(&s) else {
++        const begun = try b.vtable.begin.?(b.ptr, &s);
++        try std.testing.expectEqual(p.cached, begun.cached);
++        const n: u64 = s.prompt_len - 1;
++        const mid = (begun.cached + n) / 2;
++        try b.vtable.piece.?(b.ptr, &s, begun.cached, mid, false);
++        try b.vtable.piece.?(b.ptr, &s, mid, n, false);
++        if (path == .tail) try std.testing.expect(!try b.vtable.join.?(b.ptr, &s)) else try b.vtable.finish.?(b.ptr, &s);
++    }
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    var seen = try Seen.take(t, d, x, &s);
++    errdefer seen.deinit();
++    const mask = if (s.grammar) |gr| try gr.next(arena.allocator()) else null;
++    const h = if (mask) |m| try b.vtable.first_masked.?(b.ptr, &s, s.prompt_len, m) else try b.first(&s, s.prompt_len);
++    seen.first = try b.read(h);
++    const after = try Seen.take(t, d, x, &s);
++    defer after.deinit();
++    try seen.expectSame(after, true); // first_masked ran no forward, wrote no KV row and drafted nothing
++    try std.testing.expectEqual(seen.st[3] + 1, after.st[3]);
++    // only the pass's own bits are its contract: other bits, or any bits for an unmasked pass, are refused
++    var other: [Steps.words]u32 = @splat(std.math.maxInt(u32));
++    if (mask) |m| other[0] = ~m[0];
++    // bits that still allow the pick but differ by one other token: refused too (a pick-only check takes them)
++    if (mask) |m| {
++        var near: [Steps.words]u32 = undefined;
++        @memcpy(&near, m);
++        const flip: u32 = if (seen.first == Steps.stop) 0 else Steps.stop;
++        near[flip / 32] ^= @as(u32, 1) << @intCast(flip % 32);
++        try std.testing.expect(grammar.allows(&near, seen.first));
++        try std.testing.expectError(error.FirstMaskChanged, b.vtable.first_masked.?(b.ptr, &s, s.prompt_len, &near));
++    }
++    try std.testing.expectError(error.FirstMaskChanged, b.vtable.first_masked.?(b.ptr, &s, s.prompt_len, &other));
++    const refused = try Seen.take(t, d, x, &s);
++    defer refused.deinit();
++    try after.expectSame(refused, true);
++    try std.testing.expectEqual(after.st[3], refused.st[3]);
++    b.release(&s);
++    return seen;
++}
++
++const p1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2, 3, 8, 4 };
++const p2 = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5, 9, 0, 4, 5 };
++const p3 = [_]u32{ 10, 20, 30, 40, 10, 20, 30, 40, 10, 20, 30 };
++const warm: lanes.Sampling = .{ .seed = 5, .temperature = 1.0, .top_k = 20, .top_p = 0.95, .min_p = 0.02 };
++
++/// A case on `prompt` whose grammar refuses the twin's unmasked first token, so the mask decides the pick.
++fn refusing(prompt: []const u32, smp: ?lanes.Sampling) !Case {
++    const t = try twin.Twin.init(gpa, .{}, 1);
++    defer t.deinit();
++    const free = try t.serial(0, prompt, 1, smp, null);
++    defer gpa.free(free);
++    var r: u32 = 0;
++    while ((free[0] + r) % 3 == 0) r += 1;
++    return .{ .prompt = prompt, .length = 12, .r = r, .sampling = smp };
++}
++
++test "first_masked: a pick the pass drew without its bits is refused (error.FirstNotMasked)" {
++    const cs = try refusing(&p1, null);
++    const t = try twin.Twin.init(gpa, .{}, 2);
++    defer t.deinit();
++    const d = try twin.Drafter.init(gpa, t, 2);
++    defer d.deinit();
++    var p: Pieces = .{ .t = t, .pass = d.pass(), .drop_bits = true };
++    var c = try servedCosts(gpa);
++    defer c.deinit(gpa);
++    const x = try ln.Lanes.init(gpa, p.target(), d.pass(), c, .{ .shape = d.shape, .slots = 1 });
++    defer x.deinit();
++    var g: Steps = .{ .length = cs.length, .r = cs.r };
++    var k: grammar.Constraint = .init(g.rules(), Steps.words, null);
++    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = cs.prompt, .max_new = cs.length + 8, .sampling = cs.sampling, .grammar = &k });
++    defer s.deinit(gpa);
++    const b = x.backend();
++    const begun = try b.vtable.begin.?(b.ptr, &s);
++    try b.vtable.piece.?(b.ptr, &s, begun.cached, s.prompt_len - 1, false);
++    try b.vtable.finish.?(b.ptr, &s);
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    // the bits are the pass's own (the lanes kept them), but the target drew the unmasked pick, which they refuse
++    const mask = (try k.next(arena.allocator())).?;
++    try std.testing.expectError(error.FirstNotMasked, b.vtable.first_masked.?(b.ptr, &s, s.prompt_len, mask));
++    b.release(&s);
++}
++
++test "first_masked: the pass's pick under the first bits, whole, in pieces, cached or tail-run; KV and drafter unchanged" {
++    for ([_][]const u32{ &p1, &p2, &p3 }) |prompt| for ([_]?lanes.Sampling{ null, warm }) |smp| {
++        const cs = try refusing(prompt, smp);
++        const want = try gt.serial(cs);
++        defer gpa.free(want);
++        for ([_]Path{ .whole, .pieces, .cached, .tail }) |path| {
++            const masked = try probe(cs, path, true);
++            defer masked.deinit();
++            const plain = try probe(cs, path, false);
++            defer plain.deinit();
++            try std.testing.expectEqual(want[0], masked.first);
++            try std.testing.expect((masked.first + cs.r) % 3 == 0 and (plain.first + cs.r) % 3 != 0);
++            // the grammar changed only the pick: the pass left the same KV rows, taps and drafter rings
++            try masked.expectSame(plain, false);
++        }
++    };
++}
++
++/// The cases through the lane engine with their prompts in pieces on `path` (`.whole`: added whole), four at once.
++fn runPath(cases: []const Case, path: Path, slots: u32) ![][]u32 {
++    const t = try twin.Twin.init(gpa, .{}, slots + 1);
++    defer t.deinit();
++    const d = try twin.Drafter.init(gpa, t, slots + 1);
++    defer d.deinit();
++    var p: Pieces = .{ .t = t, .pass = d.pass(), .cached = if (path == .cached) 4 else 0, .ran_tail = path == .tail };
++    var c = try servedCosts(gpa);
++    defer c.deinit(gpa);
++    const x = try ln.Lanes.init(gpa, if (path == .whole) t.target() else p.target(), d.pass(), c, .{ .shape = d.shape, .slots = slots });
++    defer x.deinit();
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    var cfg = try lanes.Config.init(gpa, try x.model(arena.allocator(), 64), 16, 15);
++    defer cfg.deinit(gpa);
++    cfg.join_tail = path == .joined or path == .tail;
++    var clock: lanes.fake.FixedClock = .{};
++    var e = lanes.Engine.init(gpa, &cfg, x.backend(), clock.clock());
++    defer e.deinit();
++    x.attach(&e);
++    const gs = try gpa.alloc(Steps, cases.len);
++    defer gpa.free(gs);
++    const cons = try gpa.alloc(grammar.Constraint, cases.len);
++    defer gpa.free(cons);
++    const streams = try gpa.alloc(lanes.Stream, cases.len);
++    defer gpa.free(streams);
++    for (cases, gs, cons, streams) |cs, *g, *k, *s| {
++        g.* = .{ .length = cs.length, .r = cs.r };
++        k.* = .init(g.rules(), Steps.words, null);
++        s.* = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = cs.prompt, .max_new = cs.length + 8, .sampling = cs.sampling, .grammar = k });
++    }
++    defer for (streams) |*s| s.deinit(gpa);
++    for (streams) |*s| {
++        if (path == .whole) {
++            try e.addStream(s);
++            continue;
++        }
++        const begun = try e.beginStream(s);
++        try e.piece(s, begun.cached, s.prompt_len - 1, false);
++        try e.finishStream(s);
++    }
++    while (e.activeCount() > 0) try e.step();
++    const out = try gpa.alloc([]u32, cases.len);
++    for (out, streams) |*o, *s| {
++        try std.testing.expectEqualStrings("", s.problem);
++        try std.testing.expect(s.reason == .stop);
++        o.* = try gpa.dupe(u32, s.emitted());
++    }
++    return out;
++}
++
++test "first_masked: replies whose prompts came whole, in pieces, cached, joined or tail-run equal their masked serial decode" {
++    for ([_]?lanes.Sampling{ null, warm }) |smp| {
++        var cases: [3]Case = undefined;
++        for (&cases, [_][]const u32{ &p1, &p2, &p3 }) |*cs, prompt| cs.* = try refusing(prompt, smp);
++        for ([_]Path{ .whole, .pieces, .cached, .joined, .tail }) |path| {
++            const got = try runPath(&cases, path, 4);
++            defer {
++                for (got) |o| gpa.free(o);
++                gpa.free(got);
++            }
++            for (cases, got) |cs, reply| {
++                const want = try gt.serial(cs);
++                defer gpa.free(want);
++                try std.testing.expectEqualSlices(u32, want, reply);
++            }
++        }
++    }
++}
+diff --git a/zig/src/families/deepseek_v41/draft/lanes_grammar_test.zig b/zig/src/families/deepseek_v41/draft/lanes_grammar_test.zig
+new file mode 100644
+index 00000000000..1892e4571ec
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/draft/lanes_grammar_test.zig
+@@ -0,0 +1,408 @@
++//! Structured output through DeepSeek's lane backend on the CPU twin: grammar replies equal their masked serial decode.
++const std = @import("std");
++const lanes = @import("lanes");
++const twin = @import("twin.zig");
++const iface = @import("iface.zig");
++const ln = @import("lanes.zig");
++const servedCosts = @import("lanes_test.zig").servedCosts;
++
++const gpa = std.testing.allocator;
++const grammar = lanes.grammar;
++
++/// A test grammar over the twin's 48 tokens: `length` tokens t with (t + step + r) % 3 == 0, then token 47.
++pub const Steps = struct {
++    length: u32,
++    r: u32,
++    early: u32 = 0, // > 0: the stop token is also allowed after this many tokens (grammar_budget can then bind)
++    at: u32 = 0,
++    done: bool = false,
++    pub const stop: u32 = 47;
++    pub const words = 2;
++
++    pub fn rules(g: *Steps) grammar.Rules {
++        const plain: *const grammar.Rules.VTable = &.{ .accept = accept, .rollback = rollback, .terminated = terminated, .fill = fill, .drafts = drafts, .free = free };
++        const budgeted: *const grammar.Rules.VTable = &.{ .accept = accept, .rollback = rollback, .terminated = terminated, .fill = fill, .drafts = drafts, .free = free, .budget = budget };
++        // matchers are independent: four streams' windows take the lane core's parallel walk (grammar_parallel.zig)
++        return .{ .ptr = g, .parallel_walk = true, .vtable = if (g.early > 0) budgeted else plain };
++    }
++
++    fn cast(ptr: *anyopaque) *Steps {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    fn allows(g: *const Steps, t: u32) bool {
++        if (g.done) return false;
++        if (g.at == g.length or (g.early > 0 and g.at >= g.early and t == stop)) return t == stop;
++        return t != stop and (t + g.at + g.r) % 3 == 0;
++    }
++
++    fn accept(ptr: *anyopaque, t: u32) anyerror!bool {
++        const g = cast(ptr);
++        if (!g.allows(t)) return false;
++        if (t == stop) g.done = true else g.at += 1;
++        return true;
++    }
++
++    fn rollback(ptr: *anyopaque, n: usize) anyerror!void {
++        const g = cast(ptr);
++        for (0..n) |_| {
++            if (g.done) g.done = false else g.at -= 1;
++        }
++    }
++
++    /// grammar_budget: clear tokens after which the stop token cannot come within `left` draws (none: leave all).
++    fn budget(ptr: *anyopaque, words_: []u32, left: u32) anyerror!bool {
++        const g = cast(ptr);
++        if (words_.len == 0 or g.done) return true;
++        const need = 2 + (g.early -| (g.at + 1)); // a non-stop token, then up to `early`, then the stop token
++        if (need <= left or !grammar.allows(words_, stop)) return true;
++        @memset(words_, 0);
++        words_[stop / 32] = @as(u32, 1) << @intCast(stop % 32);
++        return true;
++    }
++
++    fn terminated(ptr: *anyopaque) bool {
++        return cast(ptr).done;
++    }
++
++    pub fn fill(ptr: *anyopaque, out: []u32) anyerror!void {
++        const g = cast(ptr);
++        @memset(out, 0);
++        for (0..out.len * 32) |t| if (g.allows(@intCast(t))) {
++            out[t / 32] |= @as(u32, 1) << @intCast(t % 32);
++        };
++    }
++
++    fn drafts(_: *anyopaque, _: []u32) anyerror!usize {
++        return 0;
++    }
++
++    fn free(_: *anyopaque) void {}
++};
++
++/// `early` with `max_new` below the full length: grammar_budget (armed) ends the reply within `max_new`.
++pub const Case = struct { prompt: []const u32, length: u32, r: u32 = 0, sampling: ?lanes.Sampling = null, drafts: bool = true, early: u32 = 0, max_new: ?u32 = null };
++
++fn maxNew(cs: Case) u32 {
++    return cs.max_new orelse cs.length + 8;
++}
++
++/// A case's grammar bits after the reply so far, the budget's too when the case has one.
++fn caseBits(cs: Case, g: *Steps, taken: usize, bits: []u32) !void {
++    try Steps.fill(g, bits);
++    if (cs.early > 0) _ = try Steps.budget(g, bits, maxNew(cs) - @as(u32, @intCast(taken)));
++}
++
++/// The twin alone, one row a step, each row's draw among the tokens the case's grammar allows after the reply so far.
++pub fn serial(cs: Case) ![]u32 {
++    const t = try twin.Twin.init(gpa, .{}, 1);
++    defer t.deinit();
++    const target = t.target();
++    var g: Steps = .{ .length = cs.length, .r = cs.r, .early = cs.early };
++    var bits: [Steps.words]u32 = undefined;
++    try caseBits(cs, &g, 0, &bits);
++    try target.firstMask(0, &bits);
++    var out: std.ArrayList(u32) = .empty;
++    errdefer out.deinit(gpa);
++    var tok = try target.prefill(0, cs.prompt, cs.sampling, cs.prompt.len);
++    while (true) {
++        try out.append(gpa, tok);
++        try std.testing.expect(try Steps.accept(&g, tok));
++        if (g.done) break;
++        try caseBits(cs, &g, out.items.len, &bits);
++        const at: u64 = cs.prompt.len + out.items.len - 1;
++        var c: [1]u32 = undefined;
++        var cs_out = [_][]u32{&c};
++        try target.window(&.{.{ .slot = 0, .start = at, .tokens = &.{tok}, .parents = null, .draws = &.{at + 1}, .sampling = cs.sampling, .masks = &bits }}, &cs_out);
++        tok = c[0];
++    }
++    target.release(0);
++    return out.toOwnedSlice(gpa);
++}
++
++const Run = struct {
++    out: [][]u32,
++    drafted: u64,
++    trees: u64 = 0, // tree windows the twin ran
++    parallel: bool = false, // the lane core walked the grammars on its worker pool (four or more constrained streams)
++
++    fn deinit(r: Run) void {
++        for (r.out) |o| gpa.free(o);
++        gpa.free(r.out);
++    }
++};
++
++/// The cases through the lane engine over DeepSeek's backend on the twin, `slots` streams at once.
++fn run(cases: []const Case, slots: u32) !Run {
++    return runWith(cases, slots, 0);
++}
++
++/// `run` with `siblings` first-position siblings (TF_DSV41_TREE - 1): draft trees, their rows masked as the tree's.
++fn runWith(cases: []const Case, slots: u32, siblings: u32) !Run {
++    const t = try twin.Twin.init(gpa, .{}, slots + 1);
++    defer t.deinit();
++    const d = try twin.Drafter.init(gpa, t, slots + 1);
++    defer d.deinit();
++    var c = try servedCosts(gpa);
++    defer c.deinit(gpa);
++    const x = try ln.Lanes.init(gpa, t.target(), d.pass(), c, .{ .shape = d.shape, .slots = slots, .siblings = siblings });
++    defer x.deinit();
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    var cfg = try lanes.Config.init(gpa, try x.model(arena.allocator(), 64), 16, 15);
++    defer cfg.deinit(gpa);
++    var clock: lanes.fake.FixedClock = .{};
++    var e = lanes.Engine.init(gpa, &cfg, x.backend(), clock.clock());
++    defer e.deinit();
++    x.attach(&e);
++    const gs = try gpa.alloc(Steps, cases.len);
++    defer gpa.free(gs);
++    const cons = try gpa.alloc(grammar.Constraint, cases.len);
++    defer gpa.free(cons);
++    const streams = try gpa.alloc(lanes.Stream, cases.len);
++    defer gpa.free(streams);
++    for (cases, gs, cons, streams) |cs, *g, *k, *s| {
++        g.* = .{ .length = cs.length, .r = cs.r, .early = cs.early };
++        k.* = .init(g.rules(), Steps.words, null);
++        if (cs.early > 0) try k.arm();
++        s.* = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = cs.prompt, .max_new = maxNew(cs), .sampling = cs.sampling, .drafts = cs.drafts, .grammar = k });
++    }
++    defer for (streams) |*s| s.deinit(gpa);
++    for (streams) |*s| try e.addStream(s);
++    while (e.activeCount() > 0) try e.step();
++    const out = try gpa.alloc([]u32, cases.len);
++    for (out, streams) |*o, *s| {
++        try std.testing.expectEqualStrings("", s.problem);
++        try std.testing.expect(s.reason == .stop);
++        o.* = try gpa.dupe(u32, s.emitted());
++    }
++    return .{ .out = out, .drafted = e.drafted, .trees = t.trees, .parallel = e.grammar_workers.pool != null };
++}
++
++const p1 = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9, 7, 9, 3, 2, 3, 8, 4 };
++const p2 = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5, 9, 0, 4, 5 };
++const p3 = [_]u32{ 10, 20, 30, 40, 10, 20, 30, 40, 10, 20, 30 };
++const warm: lanes.Sampling = .{ .seed = 5, .temperature = 1.0, .top_k = 20, .top_p = 0.95, .min_p = 0.02 };
++
++test "a structured reply equals its masked serial decode, drafted or not, alone or beside three others" {
++    for ([_]?lanes.Sampling{ null, warm }) |smp| {
++        const cases = [_]Case{ .{ .prompt = &p1, .length = 40, .sampling = smp }, .{ .prompt = &p2, .length = 33, .r = 1, .sampling = smp }, .{ .prompt = &p3, .length = 52, .r = 2, .sampling = smp }, .{ .prompt = &p2, .length = 24, .r = 2, .sampling = smp } };
++        var plain: [cases.len]Case = cases;
++        for (&plain) |*cs| cs.drafts = false;
++        const together = try run(&cases, 4);
++        defer together.deinit();
++        const undrafted = try run(&plain, 4);
++        defer undrafted.deinit();
++        try std.testing.expect(together.drafted > 0 and undrafted.drafted == 0 and together.parallel);
++        for (cases, together.out, undrafted.out) |cs, got, flat| {
++            const want = try serial(cs);
++            defer gpa.free(want);
++            try std.testing.expectEqual(@as(usize, cs.length + 1), want.len);
++            try std.testing.expectEqualSlices(u32, want, got);
++            try std.testing.expectEqualSlices(u32, want, flat);
++            const solo = try run(&.{cs}, 1);
++            defer solo.deinit();
++            try std.testing.expectEqualSlices(u32, want, solo.out[0]);
++        }
++    }
++}
++
++test "the grammar changes the reply: its first and later draws follow the bits" {
++    const cs: Case = .{ .prompt = &p1, .length = 30, .r = 1 };
++    const got = try run(&.{cs}, 1);
++    defer got.deinit();
++    const t = try twin.Twin.init(gpa, .{}, 1);
++    defer t.deinit();
++    const unmasked = try t.serial(0, cs.prompt, cs.length + 1, null, null);
++    defer gpa.free(unmasked);
++    try std.testing.expect(!std.mem.eql(u32, unmasked, got.out[0]));
++    for (got.out[0][0..cs.length], 0..) |tok, k| try std.testing.expect((tok + k + cs.r) % 3 == 0 and tok != Steps.stop);
++    try std.testing.expectEqual(Steps.stop, got.out[0][cs.length]);
++}
++
++/// The twin with prompts in pieces as the GPU target runs them; `tail` leaves the last row to the first round.
++const Joining = struct {
++    t: *twin.Twin,
++    pass: iface.Pass,
++
++    fn target(j: *Joining) iface.Target {
++        return .{ .ptr = j, .vtable = &.{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .first_mask = firstMask, .begin = begin, .piece = piece, .finish = finish, .tail = tail } };
++    }
++
++    fn inner(ptr: *anyopaque) iface.Target {
++        const j: *Joining = @ptrCast(@alignCast(ptr));
++        return j.t.target();
++    }
++
++    fn prefill(ptr: *anyopaque, slot: u32, ids: []const u32, smp: ?lanes.Sampling, draw: u64) anyerror!u32 {
++        return inner(ptr).prefill(slot, ids, smp, draw);
++    }
++
++    fn window(ptr: *anyopaque, segments: []const iface.Segment, choices: [][]u32) anyerror!void {
++        return inner(ptr).window(segments, choices);
++    }
++
++    fn keep(ptr: *anyopaque, slot: u32, path: []const u32) anyerror!void {
++        return inner(ptr).keep(slot, path);
++    }
++
++    fn taps(ptr: *anyopaque, slot: u32) iface.Taps {
++        return inner(ptr).taps(slot);
++    }
++
++    fn release(ptr: *anyopaque, slot: u32) void {
++        inner(ptr).release(slot);
++    }
++
++    fn firstMask(ptr: *anyopaque, slot: u32, bits: []const u32) void {
++        inner(ptr).firstMask(slot, bits) catch unreachable;
++    }
++
++    fn begin(_: *anyopaque, _: u32, _: []const u32) anyerror!iface.Target.Begun {
++        return .{};
++    }
++
++    fn piece(_: *anyopaque, _: u32, _: []const u32, _: u64, _: u64, _: bool) anyerror!void {}
++
++    fn finish(ptr: *anyopaque, slot: u32, ids: []const u32, smp: ?lanes.Sampling, draw: u64) anyerror!u32 {
++        return inner(ptr).prefill(slot, ids, smp, draw);
++    }
++
++    fn tail(ptr: *anyopaque, slot: u32, ids: []const u32, smp: ?lanes.Sampling, _: u64) anyerror!?u32 {
++        const j: *Joining = @ptrCast(@alignCast(ptr));
++        const t = inner(ptr);
++        try t.firstMask(slot, &.{}); // the first token comes from the round's window, its bits the lane core's
++        _ = try t.prefill(slot, ids[0 .. ids.len - 1], smp, ids.len - 1);
++        const tp = t.taps(slot);
++        var rows: [64]u32 = undefined;
++        for (rows[0..tp.rows], 0..) |*r, i| r.* = @intCast(i);
++        try j.pass.ingest(slot, 0, tp, rows[0..tp.rows]);
++        return null;
++    }
++};
++
++/// The cases' prompts in one piece each, then joined (`together`: one draft call, TF_DSV41_JOIN_DRAFTS), then rounds.
++fn runJoined(cases: []const Case, slots: u32, together: bool) !Run {
++    const t = try twin.Twin.init(gpa, .{}, slots + 1);
++    defer t.deinit();
++    const d = try twin.Drafter.init(gpa, t, slots + 1);
++    defer d.deinit();
++    var j: Joining = .{ .t = t, .pass = d.pass() };
++    var c = try servedCosts(gpa);
++    defer c.deinit(gpa);
++    const x = try ln.Lanes.init(gpa, j.target(), d.pass(), c, .{ .shape = d.shape, .slots = slots });
++    defer x.deinit();
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    var cfg = try lanes.Config.init(gpa, try x.model(arena.allocator(), 64), 16, 15);
++    defer cfg.deinit(gpa);
++    cfg.join_tail = true;
++    cfg.join_drafts = together;
++    var clock: lanes.fake.FixedClock = .{};
++    var e = lanes.Engine.init(gpa, &cfg, x.backend(), clock.clock());
++    defer e.deinit();
++    x.attach(&e);
++    const gs = try gpa.alloc(Steps, cases.len);
++    defer gpa.free(gs);
++    const cons = try gpa.alloc(grammar.Constraint, cases.len);
++    defer gpa.free(cons);
++    const streams = try gpa.alloc(lanes.Stream, cases.len);
++    defer gpa.free(streams);
++    const ptrs = try gpa.alloc(*lanes.Stream, cases.len);
++    defer gpa.free(ptrs);
++    const errs = try gpa.alloc(?anyerror, cases.len);
++    defer gpa.free(errs);
++    for (cases, gs, cons, streams, ptrs) |cs, *g, *k, *s, *p| {
++        g.* = .{ .length = cs.length, .r = cs.r };
++        k.* = .init(g.rules(), Steps.words, null);
++        s.* = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = cs.prompt, .max_new = cs.length + 8, .sampling = cs.sampling, .drafts = cs.drafts, .grammar = k });
++        p.* = s;
++    }
++    defer for (streams) |*s| s.deinit(gpa);
++    for (streams) |*s| {
++        _ = try e.beginStream(s);
++        try e.piece(s, 0, s.prompt_len - 1, false);
++    }
++    if (together) {
++        try std.testing.expectEqual(cases.len, try e.finishStreams(ptrs, errs));
++        for (errs) |x_| if (x_) |err| return err;
++    } else for (ptrs) |s| try e.finishStream(s);
++    while (e.activeCount() > 0) try e.step();
++    const out = try gpa.alloc([]u32, cases.len);
++    for (out, streams) |*o, *s| {
++        try std.testing.expectEqualStrings("", s.problem);
++        try std.testing.expect(s.reason == .stop);
++        o.* = try gpa.dupe(u32, s.emitted());
++    }
++    return .{ .out = out, .drafted = e.drafted };
++}
++
++test "a joined prompt's first round walks its held drafts: replies equal their masked serial decode" {
++    for ([_]?lanes.Sampling{ null, warm }) |smp| {
++        const cases = [_]Case{ .{ .prompt = &p1, .length = 40, .sampling = smp }, .{ .prompt = &p2, .length = 33, .r = 1, .sampling = smp }, .{ .prompt = &p3, .length = 52, .r = 2, .sampling = smp }, .{ .prompt = &p2, .length = 24, .r = 2, .sampling = smp } };
++        for ([_]bool{ true, false }) |together| {
++            var wants: [cases.len][]u32 = undefined;
++            for (cases, &wants) |cs, *want| want.* = try serial(cs);
++            defer for (wants) |want| gpa.free(want);
++            for (cases, wants) |cs, want| {
++                const solo = try runJoined(&.{cs}, 1, together);
++                defer solo.deinit();
++                try std.testing.expect(solo.drafted > 0);
++                try std.testing.expectEqualSlices(u32, want, solo.out[0]);
++            }
++            const four = try runJoined(&cases, 4, together);
++            defer four.deinit();
++            try std.testing.expect(four.drafted > 0);
++            for (wants, four.out) |want, got| try std.testing.expectEqualSlices(u32, want, got);
++        }
++    }
++}
++
++test "draft trees under a grammar: each tree row is masked as its own path, so replies equal their masked serial decode" {
++    for ([_]?lanes.Sampling{ null, warm }) |smp| {
++        const cases = [_]Case{ .{ .prompt = &p1, .length = 40, .sampling = smp }, .{ .prompt = &p2, .length = 33, .r = 1, .sampling = smp }, .{ .prompt = &p3, .length = 52, .r = 2, .sampling = smp }, .{ .prompt = &p2, .length = 24, .r = 2, .sampling = smp } };
++        for ([_]u32{ 1, 2, 3 }) |siblings| {
++            const four = try runWith(&cases, 4, siblings);
++            defer four.deinit();
++            try std.testing.expect(four.trees > 0 and four.drafted > 0);
++            for (cases, four.out) |cs, got| {
++                const want = try serial(cs);
++                defer gpa.free(want);
++                try std.testing.expectEqualSlices(u32, want, got);
++                const solo = try runWith(&.{cs}, 1, siblings);
++                defer solo.deinit();
++                try std.testing.expectEqualSlices(u32, want, solo.out[0]);
++            }
++        }
++    }
++}
++
++test "grammar_budget binds inside max_new: drafted, undrafted, trees and four at once end on the stop token alike" {
++    for ([_]?lanes.Sampling{ null, warm }) |smp| {
++        const cases = [_]Case{ .{ .prompt = &p1, .length = 40, .early = 6, .max_new = 12, .sampling = smp }, .{ .prompt = &p2, .length = 33, .r = 1, .early = 4, .max_new = 9, .sampling = smp }, .{ .prompt = &p3, .length = 52, .r = 2, .early = 10, .max_new = 15, .sampling = smp }, .{ .prompt = &p2, .length = 24, .r = 2, .early = 3, .max_new = 7, .sampling = smp } };
++        var plain: [cases.len]Case = cases;
++        for (&plain) |*cs| cs.drafts = false;
++        const together = try run(&cases, 4);
++        defer together.deinit();
++        const undrafted = try run(&plain, 4);
++        defer undrafted.deinit();
++        const trees = try runWith(&cases, 4, 2);
++        defer trees.deinit();
++        try std.testing.expect(together.drafted > 0 and undrafted.drafted == 0 and trees.trees > 0);
++        for (cases, together.out, undrafted.out, trees.out) |cs, got, flat, tree_| {
++            const want = try serial(cs);
++            defer gpa.free(want);
++            // the budget bound: the reply ends on the stop token within max_new, where the grammar alone runs on
++            try std.testing.expect(want.len <= cs.max_new.? and want[want.len - 1] == Steps.stop);
++            var free_ = cs;
++            free_.max_new = cs.length + 8;
++            const unbound = try serial(free_);
++            defer gpa.free(unbound);
++            try std.testing.expect(unbound.len > cs.max_new.?);
++            for ([_][]const u32{ got, flat, tree_ }) |x| try std.testing.expectEqualSlices(u32, want, x);
++            const solo = try run(&.{cs}, 1);
++            defer solo.deinit();
++            try std.testing.expectEqualSlices(u32, want, solo.out[0]);
++        }
++    }
++}
+diff --git a/zig/src/families/deepseek_v41/draft/twin.zig b/zig/src/families/deepseek_v41/draft/twin.zig
+index 5380f891658..7f3551853f7 100644
+--- a/zig/src/families/deepseek_v41/draft/twin.zig
++++ b/zig/src/families/deepseek_v41/draft/twin.zig
+@@ -18,6 +18,7 @@ const Slot = struct {
+     taps: std.ArrayList(f32) = .empty,
+     hist: std.ArrayList(f32) = .empty, // committed rows' taps [len][dim] (Target.history)
+     live: bool = false,
++    first: []const u32 = &.{}, // pending prompt completion mask; empty means no grammar
+ 
+     fn deinit(s: *Slot, gpa: Allocator) void {
+         s.k.deinit(gpa);
+@@ -45,6 +46,7 @@ pub const Twin = struct {
+     slots: []Slot,
+     windows: u64 = 0, // rows' passes run (tests)
+     widest: usize = 0, // the most rows one forward held
++    trees: u64 = 0, // windows with parents: draft trees (tests)
+ 
+     pub fn init(gpa: Allocator, dims: Dims, slots: usize) !*Twin {
+         var prng = std.Random.DefaultPrng.init(dims.seed);
+@@ -127,7 +129,10 @@ pub const Twin = struct {
+         return @intCast(try lanes.sampling.choose(scratch, vals, ids, draw, smp));
+     }
+ 
+-    fn rowsOf(t: *Twin, s: *Slot, tokens: []const u32, parents: ?[]const i32, start: u64, draws: []const u64, smp: ?lanes.Sampling, choices: []u32) !void {
++    /// Grammar bits for a forward's last rows: rows [from, n) take `rows` in order (empty: none), as Segment.masks.
++    const Bits = struct { rows: []const u32 = &.{}, from: usize = 0 };
++
++    fn rowsOf(t: *Twin, s: *Slot, tokens: []const u32, parents: ?[]const i32, start: u64, draws: []const u64, smp: ?lanes.Sampling, choices: []u32, bits: Bits) !void {
+         const d = t.dims.dim;
+         const a = t.gpa;
+         s.rows.clearRetainingCapacity();
+@@ -173,6 +178,13 @@ pub const Twin = struct {
+             @memcpy(h, x[0..d]);
+             t.attend(q[0..d], keys[0 .. committed + depth], vals[0 .. committed + depth], h);
+             t.logits(h, tokens[r], row);
++            if (bits.rows.len > 0 and r >= bits.from) {
++                const words = bits.rows.len / (n - bits.from);
++                const allowed = bits.rows[(r - bits.from) * words ..][0..words];
++                for (row, 0..) |*o, i| if (!lanes.grammar.allows(allowed, i)) {
++                    o.* = -std.math.inf(f32);
++                };
++            }
+             choices[r] = try t.choose(a, row, draws[r], smp);
+         }
+         s.base = committed;
+@@ -186,12 +198,16 @@ pub const Twin = struct {
+     }
+ 
+     pub fn target(t: *Twin) iface.Target {
+-        return .{ .ptr = t, .vtable = &.{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .history = history } };
++        return .{ .ptr = t, .vtable = &.{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .history = history, .first_mask = firstMask } };
+     }
+ 
+     /// The target without `history`: a plain round's rows are then absorbed in their own round.
+     pub fn targetNoHistory(t: *Twin) iface.Target {
+-        return .{ .ptr = t, .vtable = &.{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release } };
++        return .{ .ptr = t, .vtable = &.{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .first_mask = firstMask } };
++    }
++
++    fn firstMask(ptr: *anyopaque, slot: u32, bits: []const u32) void {
++        self(ptr).slots[slot].first = bits;
+     }
+ 
+     fn self(ptr: *anyopaque) *Twin {
+@@ -211,19 +227,23 @@ pub const Twin = struct {
+         draws[ids.len - 1] = draw;
+         const choices = try t.gpa.alloc(u32, ids.len);
+         defer t.gpa.free(choices);
+-        try t.rowsOf(s, ids, null, 0, draws, smp, choices);
++        defer s.first = &.{};
++        try t.rowsOf(s, ids, null, 0, draws, smp, choices, .{ .rows = s.first, .from = ids.len - 1 });
+         return choices[ids.len - 1];
+     }
+ 
+     fn window(ptr: *anyopaque, segments: []const iface.Segment, choices: [][]u32) anyerror!void {
+         const t = self(ptr);
+         var rows: usize = 0;
+-        for (segments) |g| rows += g.tokens.len;
++        for (segments) |g| {
++            rows += g.tokens.len;
++            t.trees += @intFromBool(g.parents != null);
++        }
+         t.widest = @max(t.widest, rows);
+         for (segments, choices) |g, c| {
+             const s = &t.slots[g.slot];
+             if (!s.live or g.start != s.len(t.dims.dim)) return error.PositionMismatch;
+-            try t.rowsOf(s, g.tokens, g.parents, g.start, g.draws, g.sampling, c);
++            try t.rowsOf(s, g.tokens, g.parents, g.start, g.draws, g.sampling, c, .{ .rows = g.masks });
+         }
+     }
+ 
+diff --git a/zig/src/families/deepseek_v41/forward.zig b/zig/src/families/deepseek_v41/forward.zig
+index be0bbb785e6..ee29074ea3e 100644
+--- a/zig/src/families/deepseek_v41/forward.zig
++++ b/zig/src/families/deepseek_v41/forward.zig
+@@ -126,7 +126,7 @@ pub const Forward = struct {
+     /// the keyed sampler (sampling_gpu.zig): a follower runs rank 0's sampled choices too (their gathers pair up)
+     sampler: ?Sampler = null,
+     progress: ?*@import("round_progress.zig").Progress = null,
+-    grammar: ?Grammar = null, // TF_DSV41_GRAMMAR=1: grammar masks applied to "w.logits" before a pick
++    grammar: ?Grammar = null, // structured output (grammar_gpu.zig): grammar masks applied to "w.logits" before a pick
+     calib_marks: std.ArrayList(u64) = .empty, // TF_DSV41_CALIB=measure: a follower's clock at each op_calib_mark
+ 
+     pub fn init(gpa: std.mem.Allocator, cfg: *const Config, widths: *const block.Widths, opts: block.Options, runner: *run.Runner, comm: tp.collective.Collective) Forward {
+diff --git a/zig/src/families/deepseek_v41/forward_follow.zig b/zig/src/families/deepseek_v41/forward_follow.zig
+index 514513280d0..44e443c9509 100644
+--- a/zig/src/families/deepseek_v41/forward_follow.zig
++++ b/zig/src/families/deepseek_v41/forward_follow.zig
+@@ -78,7 +78,7 @@ pub fn finishPrompt(f: *Forward) !void {
+     if (f.leads()) try f.link.?.send(&.{ op_ced_finish, @intCast(f.slot.pos) });
+     return h.finish(f);
+ }
+-/// 28: [op, sub (bind / step / release), ...] (grammar_gpu.zig; ops 28-31)
++/// 28: [op, rows, words, row ids..., bits two to a word] the next picks' masked rows (grammar_gpu.zig)
+ pub const op_grammar: i64 = 28;
+ 
+ /// 64: [op] every rank syncs its device and reads its clock; 65: [op, n] samples all-gathered (ops 64-67: calib)
+diff --git a/zig/src/families/deepseek_v41/grammar_gpu.zig b/zig/src/families/deepseek_v41/grammar_gpu.zig
+new file mode 100644
+index 00000000000..401d3f4d6ae
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/grammar_gpu.zig
+@@ -0,0 +1,233 @@
++//! Structured output on the GPU forward: rank 0 sends each pick's masked rows (op_grammar); every rank masks its part.
++
++const std = @import("std");
++const cuda = @import("cuda");
++const fwd = @import("forward.zig");
++const iface = @import("draft/iface.zig");
++const partition = @import("partition.zig");
++const ph = @import("phases.zig");
++const Allocator = std.mem.Allocator;
++
++/// One "w.logits" row's allowed tokens for the next picks: token t is bit t % 32 of word t / 32 (lanes/grammar.zig).
++pub const Row = struct { row: u32, bits: []const u32 };
++
++/// The most masked rows one forward stages (a row window's).
++pub const max_rows = 64;
++
++/// The rows the next picks mask, as rank 0 staged them and its followers received them.
++pub const Staged = struct {
++    rows: std.ArrayList(u32) = .empty,
++    bits: std.ArrayList(u32) = .empty, // `words` a row, in `rows` order
++    done: std.ArrayList(bool) = .empty, // the row's logits are masked already: a later pick of the forward skips it
++    words: usize = 0,
++
++    pub fn deinit(st: *Staged, gpa: Allocator) void {
++        st.rows.deinit(gpa);
++        st.bits.deinit(gpa);
++        st.done.deinit(gpa);
++    }
++
++    pub fn count(st: *const Staged) usize {
++        return st.rows.items.len;
++    }
++
++    fn clear(st: *Staged) void {
++        st.rows.clearRetainingCapacity();
++        st.bits.clearRetainingCapacity();
++        st.done.clearRetainingCapacity();
++        st.words = 0;
++    }
++
++    /// Replaces the staged rows with `rows` (one width of bits); a row that allows every token is left out.
++    pub fn set(st: *Staged, gpa: Allocator, rows: []const Row) !void {
++        var words: usize = 0;
++        var n: usize = 0;
++        for (rows) |r| {
++            if (allowsAll(r.bits)) continue;
++            if (words != 0 and r.bits.len != words) return error.InvalidGrammarMasks;
++            words = r.bits.len;
++            n += 1;
++        }
++        if (n > max_rows) return error.InvalidGrammarMasks;
++        try st.rows.ensureTotalCapacity(gpa, n);
++        try st.bits.ensureTotalCapacity(gpa, n * words);
++        try st.done.ensureTotalCapacity(gpa, n);
++        st.clear();
++        st.words = words;
++        for (rows) |r| if (!allowsAll(r.bits)) {
++            st.rows.appendAssumeCapacity(r.row);
++            st.bits.appendSliceAssumeCapacity(r.bits);
++            st.done.appendAssumeCapacity(false);
++        };
++    }
++
++    /// op_grammar's message: [op, rows, words, each row, then the bits two to a word].
++    pub fn encode(st: *const Staged, gpa: Allocator, out: *std.ArrayList(i64)) !void {
++        out.clearRetainingCapacity();
++        try out.appendSlice(gpa, &.{ fwd.Forward.op_grammar, @intCast(st.count()), @intCast(st.words) });
++        for (st.rows.items) |r| try out.append(gpa, r);
++        const b = st.bits.items;
++        var i: usize = 0;
++        while (i < b.len) : (i += 2) {
++            const hi: u64 = if (i + 1 < b.len) b[i + 1] else 0;
++            try out.append(gpa, @bitCast(@as(u64, b[i]) | hi << 32));
++        }
++    }
++
++    /// The rows a follower received in `encode`'s message; a malformed one is error.BadPlan.
++    pub fn decode(st: *Staged, gpa: Allocator, msg: []const i64) !void {
++        if (msg.len < 3 or msg[1] < 0 or msg[1] > max_rows or msg[2] < 0 or msg[2] > 1 << 20) return error.BadPlan;
++        const n: usize = @intCast(msg[1]);
++        const words: usize = @intCast(msg[2]);
++        const total = n * words;
++        if ((n > 0 and words == 0) or msg.len != 3 + n + (total + 1) / 2) return error.BadPlan;
++        for (msg[3..][0..n]) |r| if (r < 0 or r > std.math.maxInt(u32)) return error.BadPlan;
++        try st.rows.ensureTotalCapacity(gpa, n);
++        try st.bits.ensureTotalCapacity(gpa, total);
++        try st.done.ensureTotalCapacity(gpa, n);
++        st.clear();
++        st.words = words;
++        for (msg[3..][0..n]) |r| {
++            st.rows.appendAssumeCapacity(@intCast(r));
++            st.done.appendAssumeCapacity(false);
++        }
++        for (0..total) |i| {
++            const w: u64 = @bitCast(msg[3 + n + i / 2]);
++            st.bits.appendAssumeCapacity(@truncate(w >> @intCast(32 * (i % 2))));
++        }
++    }
++};
++
++/// Whether `bits` allow every token they cover (no grammar on the row, or one not started yet).
++pub fn allowsAll(bits: []const u32) bool {
++    for (bits) |w| if (w != std.math.maxInt(u32)) return false;
++    return true;
++}
++
++/// Turns a row's disallowed logits to -inf: column c is token lo + c; tokens past `bits` are disallowed.
++pub fn maskRow(row: []f32, lo: usize, bits: []const u32) void {
++    var c: usize = 0;
++    while (c < row.len) {
++        const t = lo + c;
++        const word: u32 = if (t / 32 < bits.len) bits[t / 32] else 0;
++        const end = @min(row.len, c + 32 - t % 32);
++        if (word != std.math.maxInt(u32)) for (row[c..end], t..) |*v, tok| {
++            if ((word >> @intCast(tok % 32)) & 1 == 0) v.* = -std.math.inf(f32);
++        };
++        c = end;
++    }
++}
++
++/// The segments' masked rows at their places in one forward (each segment's rows after the one before).
++pub fn segmentRows(out: []Row, segs: []const iface.Segment) ![]Row {
++    var n: usize = 0;
++    var at: u32 = 0;
++    for (segs) |s| {
++        defer at += @intCast(s.tokens.len);
++        if (s.masks.len == 0) continue;
++        const rows = s.tokens.len;
++        if (rows == 0 or s.masks.len % rows != 0) return error.InvalidGrammarMasks;
++        const words = s.masks.len / rows;
++        for (0..rows) |r| {
++            const bits = s.masks[r * words ..][0..words];
++            if (allowsAll(bits)) continue;
++            if (n == out.len) return error.InvalidGrammarMasks;
++            out[n] = .{ .row = at + @as(u32, @intCast(r)), .bits = bits };
++            n += 1;
++        }
++    }
++    return out[0..n];
++}
++
++/// Staged rows [at, at + len): "w.logits" rows from `row` and pinned slots from `at`, one copy each way.
++pub const Run = struct { at: u32, row: u32, len: u32 };
++
++/// The staged rows a pick of [row0, row0 + n) still masks, adjacent ones (staged and in "w.logits") as one run.
++pub fn runs(st: *const Staged, row0: u32, n: u32, out: *[max_rows]Run) []Run {
++    var k: usize = 0;
++    for (st.rows.items, st.done.items, 0..) |row, done, i| {
++        if (done or row < row0 or row - row0 >= n) continue;
++        if (k > 0 and out[k - 1].at + out[k - 1].len == i and out[k - 1].row + out[k - 1].len == row) {
++            out[k - 1].len += 1;
++            continue;
++        }
++        out[k] = .{ .at = @intCast(i), .row = row, .len = 1 };
++        k += 1;
++    }
++    return out[0..k];
++}
++
++/// Every rank's grammar hook on its forward: the staged rows and the pinned copy their logits are masked in.
++pub const Masks = struct {
++    gpa: Allocator,
++    f: *fwd.Forward,
++    lo: u32, // this rank's first column's token
++    width: u32, // its columns: a "w.logits" row
++    st: Staged = .{},
++    msg: std.ArrayList(i64) = .empty,
++    host: cuda.HostBuffer, // max_rows rows: a staged row's slot is its place in the staged list
++
++    /// Every rank, at load: the forward's grammar hook over this rank's part of the vocabulary, its pinned rows.
++    pub fn init(gpa: Allocator, f: *fwd.Forward) !*Masks {
++        const part = try partition.share(f.cfg.vocab, f.comm.rank(), f.comm.world());
++        var host = try cuda.HostBuffer.alloc(f.runner.d, max_rows * 4 * @as(usize, part.len));
++        errdefer host.free();
++        const x = try gpa.create(Masks);
++        x.* = .{ .gpa = gpa, .f = f, .lo = part.lo, .width = part.len, .host = host };
++        f.grammar = .{ .ptr = x, .follow = follow, .apply = apply };
++        return x;
++    }
++
++    pub fn deinit(x: *Masks) void {
++        x.f.grammar = null;
++        x.st.deinit(x.gpa);
++        x.msg.deinit(x.gpa);
++        x.host.free();
++        x.gpa.destroy(x);
++    }
++
++    fn self(ptr: *anyopaque) *Masks {
++        return @ptrCast(@alignCast(ptr));
++    }
++
++    /// Rank 0: the next picks' masked rows (none: unconstrained), sent to the followers whenever something is staged.
++    pub fn stage(x: *Masks, rows: []const Row) !void {
++        const had = x.st.count() > 0;
++        try x.st.set(x.gpa, rows);
++        if (!had and x.st.count() == 0) return;
++        if (!x.f.leads()) return;
++        try x.st.encode(x.gpa, &x.msg);
++        try x.f.link.?.send(x.msg.items);
++    }
++
++    fn follow(ptr: *anyopaque, msg: []const i64) anyerror!void {
++        const x = self(ptr);
++        try x.st.decode(x.gpa, msg);
++    }
++
++    /// Before a pick of rows [row0, row0 + n): the staged rows there, masked once in the pinned copy and written back.
++    fn apply(ptr: *anyopaque, row0: u32, n: u32) anyerror!void {
++        const x = self(ptr);
++        const st = &x.st;
++        var buf: [max_rows]Run = undefined;
++        const rs = runs(st, row0, n, &buf);
++        if (rs.len == 0) return;
++        const tg = ph.start(x.f.phases, .grammar);
++        defer tg.stop();
++        const r = x.f.runner;
++        const row_bytes = 4 * @as(usize, x.width);
++        const host = x.host.bytes;
++        const logits: []f32 = @alignCast(std.mem.bytesAsSlice(f32, host));
++        const base = r.addressOf("w.logits") orelse return error.Unbound;
++        for (rs) |q| {
++            const dst = host[q.at * row_bytes ..][0 .. q.len * row_bytes];
++            try r.d.check(r.d.api.cuMemcpyDtoHAsync_v2(dst.ptr, base + q.row * row_bytes, dst.len, r.stream.handle), "cuMemcpyDtoHAsync");
++        }
++        try r.stream.synchronize();
++        for (rs) |q| for (q.at..q.at + q.len) |i| {
++            maskRow(logits[i * x.width ..][0..x.width], x.lo, st.bits.items[i * st.words ..][0..st.words]);
++            st.done.items[i] = true;
++        };
++        for (rs) |q| try cuda.copy_source.enqueue(r.d, base + q.row * row_bytes, host[q.at * row_bytes ..][0 .. q.len * row_bytes], r.stream);
++    }
++};
+diff --git a/zig/src/families/deepseek_v41/grammar_gpu_test.zig b/zig/src/families/deepseek_v41/grammar_gpu_test.zig
+new file mode 100644
+index 00000000000..bfe6d0b56dd
+--- /dev/null
++++ b/zig/src/families/deepseek_v41/grammar_gpu_test.zig
+@@ -0,0 +1,89 @@
++//! Structured output's host side on the GPU forward: staged rows, the follower's message and a rank's column mask.
++const std = @import("std");
++const gg = @import("grammar_gpu.zig");
++const iface = @import("draft/iface.zig");
++
++const gpa = std.testing.allocator;
++const all = std.math.maxInt(u32);
++
++test "a staged window keeps its constrained rows at their places, and a follower decodes the same rows" {
++    // two segments in one forward: 3 rows (the middle one unconstrained), then 2 rows without a grammar, then 2 rows
++    const a = [_]u32{ 0b101, 7, all, all, 1 << 31, 0 };
++    const c = [_]u32{ 1, 2, 3, 4 };
++    const segs = [_]iface.Segment{
++        .{ .slot = 0, .start = 5, .tokens = &.{ 1, 2, 3 }, .parents = null, .draws = &.{ 6, 7, 8 }, .sampling = null, .masks = &a },
++        .{ .slot = 1, .start = 9, .tokens = &.{ 4, 5 }, .parents = null, .draws = &.{ 10, 11 }, .sampling = null },
++        .{ .slot = 2, .start = 0, .tokens = &.{ 6, 7 }, .parents = null, .draws = &.{ 1, 2 }, .sampling = null, .masks = &c },
++    };
++    var buf: [gg.max_rows]gg.Row = undefined;
++    const rows = try gg.segmentRows(&buf, &segs);
++    try std.testing.expectEqual(@as(usize, 4), rows.len);
++    for (rows, [_]u32{ 0, 2, 5, 6 }) |r, want| try std.testing.expectEqual(want, r.row);
++    var st: gg.Staged = .{};
++    defer st.deinit(gpa);
++    try st.set(gpa, rows);
++    var msg: std.ArrayList(i64) = .empty;
++    defer msg.deinit(gpa);
++    try st.encode(gpa, &msg);
++    try std.testing.expectEqual(@as(usize, 3 + 4 + 4), msg.items.len); // 8 words, two to an i64
++    var got: gg.Staged = .{};
++    defer got.deinit(gpa);
++    try got.decode(gpa, msg.items);
++    try std.testing.expectEqualSlices(u32, st.rows.items, got.rows.items);
++    try std.testing.expectEqualSlices(u32, st.bits.items, got.bits.items);
++    try std.testing.expectEqualSlices(u32, &.{ 0b101, 7, 1 << 31, 0, 1, 2, 3, 4 }, got.bits.items);
++    // an odd word count packs its last word alone; nothing staged clears the follower's rows
++    try st.set(gpa, &.{.{ .row = 3, .bits = &.{9} }});
++    try st.encode(gpa, &msg);
++    try got.decode(gpa, msg.items);
++    try std.testing.expectEqualSlices(u32, &.{9}, got.bits.items);
++    try st.set(gpa, &.{.{ .row = 1, .bits = &.{ all, all } }});
++    try std.testing.expectEqual(@as(usize, 0), st.count());
++    try st.encode(gpa, &msg);
++    try got.decode(gpa, msg.items);
++    try std.testing.expectEqual(@as(usize, 0), got.count());
++}
++
++test "malformed masks and messages are refused before anything changes" {
++    var buf: [gg.max_rows]gg.Row = undefined;
++    const bad = [_]iface.Segment{.{ .slot = 0, .start = 0, .tokens = &.{ 1, 2 }, .parents = null, .draws = &.{ 1, 2 }, .sampling = null, .masks = &.{ 1, 2, 3 } }};
++    try std.testing.expectError(error.InvalidGrammarMasks, gg.segmentRows(&buf, &bad));
++    var st: gg.Staged = .{};
++    defer st.deinit(gpa);
++    try st.set(gpa, &.{.{ .row = 0, .bits = &.{ 1, 2 } }});
++    try std.testing.expectError(error.InvalidGrammarMasks, st.set(gpa, &.{ .{ .row = 0, .bits = &.{1} }, .{ .row = 1, .bits = &.{ 1, 2 } } }));
++    try std.testing.expectEqual(@as(usize, 1), st.count()); // the earlier rows stay staged
++    const op = @import("forward.zig").Forward.op_grammar;
++    for ([_][]const i64{ &.{op}, &.{ op, 1, 0 }, &.{ op, 1, 2, 0 }, &.{ op, 1, 2, -1, 5 }, &.{ op, 65, 1 } }) |m| try std.testing.expectError(error.BadPlan, st.decode(gpa, m));
++    try std.testing.expectEqual(@as(usize, 1), st.count());
++}
++
++test "a rank masks its own columns: column c is token lo + c, tokens past the bits are disallowed" {
++    var row: [96]f32 = undefined;
++    for (&row, 0..) |*v, i| v.* = @floatFromInt(i);
++    // rank 1 of a 256-token vocabulary: tokens 128..223 in its 96 columns; the bits cover tokens 0..191 only
++    var bits: [6]u32 = @splat(0);
++    bits[4] = (1 << 3) | (1 << 31); // tokens 131 and 159
++    bits[5] = all; // tokens 160..191
++    gg.maskRow(&row, 128, &bits);
++    for (row, 0..) |v, c| {
++        const t = 128 + c;
++        const on = t == 131 or t == 159 or (t >= 160 and t < 192);
++        try std.testing.expectEqual(on, v == @as(f32, @floatFromInt(c)));
++        if (!on) try std.testing.expect(v == -std.math.inf(f32));
++    }
++}
++
++test "a pick copies the masked rows, not their span: adjacent rows go as one run into slots in staged order" {
++    const b = [_]u32{1};
++    var st: gg.Staged = .{};
++    defer st.deinit(gpa);
++    try st.set(gpa, &.{ .{ .row = 0, .bits = &b }, .{ .row = 1, .bits = &b }, .{ .row = 2, .bits = &b }, .{ .row = 5, .bits = &b }, .{ .row = 63, .bits = &b } });
++    var buf: [gg.max_rows]gg.Run = undefined;
++    try std.testing.expectEqualDeep(@as([]const gg.Run, &.{ .{ .at = 0, .row = 0, .len = 3 }, .{ .at = 3, .row = 5, .len = 1 }, .{ .at = 4, .row = 63, .len = 1 } }), gg.runs(&st, 0, 64, &buf));
++    // a pick of rows [1, 6): rows 1, 2 and 5 only
++    try std.testing.expectEqualDeep(@as([]const gg.Run, &.{ .{ .at = 1, .row = 1, .len = 2 }, .{ .at = 3, .row = 5, .len = 1 } }), gg.runs(&st, 1, 5, &buf));
++    // rows an earlier pick of the forward masked are skipped, and split a run
++    st.done.items[1] = true;
++    try std.testing.expectEqualDeep(@as([]const gg.Run, &.{ .{ .at = 0, .row = 0, .len = 1 }, .{ .at = 2, .row = 2, .len = 1 }, .{ .at = 3, .row = 5, .len = 1 }, .{ .at = 4, .row = 63, .len = 1 } }), gg.runs(&st, 0, 64, &buf));
++}
+diff --git a/zig/src/families/deepseek_v41/phases.zig b/zig/src/families/deepseek_v41/phases.zig
+index bfd86f1caf9..76566dcfafb 100644
+--- a/zig/src/families/deepseek_v41/phases.zig
++++ b/zig/src/families/deepseek_v41/phases.zig
+@@ -25,6 +25,8 @@ pub const Name = enum {
+     @"draft.chain",
+     /// inside `draft.pass`, the host step (DRAFT_GRAPHS off): the logits' download, the host candidates, their gather
+     @"draft.host",
++    /// structured output (grammar_gpu.zig): a pick's masked rows copied out, masked on the host and copied back
++    grammar,
+ };
+ 
+ /// A gap between top-level phases this long or longer is idle (no live stream), not a round's host time.
+diff --git a/zig/src/families/deepseek_v41/phases_timed.zig b/zig/src/families/deepseek_v41/phases_timed.zig
+index b2c38fadaeb..2554931c69e 100644
+--- a/zig/src/families/deepseek_v41/phases_timed.zig
++++ b/zig/src/families/deepseek_v41/phases_timed.zig
+@@ -17,7 +17,12 @@ pub const TimedTarget = struct {
+         return .{ .ptr = t, .vtable = &vtable };
+     }
+ 
+-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays, .warm = warm, .resumed = resumed };
++    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays, .warm = warm, .resumed = resumed, .first_mask = firstMask };
++
++    fn firstMask(p: *anyopaque, slot: u32, bits: []const u32) void {
++        const inner = self(p).inner;
++        if (inner.vtable.first_mask) |f| f(inner.ptr, slot, bits);
++    }
+ 
+     fn resumed(p: *anyopaque, slot: u32) u64 {
+         return self(p).inner.resumedRows(slot);
+diff --git a/zig/src/families/deepseek_v41/sampling_test.zig b/zig/src/families/deepseek_v41/sampling_test.zig
+index cb4c1c61a5c..aa9545067f2 100644
+--- a/zig/src/families/deepseek_v41/sampling_test.zig
++++ b/zig/src/families/deepseek_v41/sampling_test.zig
+@@ -41,6 +41,32 @@ test "two, three and four ranks: uneven candidate and whole-row sampling match o
+     }
+ }
+ 
++test "a nucleus row whose grammar masks one rank's whole slice picks from its candidates, as one rank and a whole row do" {
++    const vocab = 1280;
++    const n = 2;
++    const a = testing.allocator;
++    const logits = try a.alloc(f32, n * vocab);
++    defer a.free(logits);
++    @memset(logits, -std.math.inf(f32));
++    var random = std.Random.DefaultPrng.init(847);
++    // row 0 allows 12 tokens in rank 0's 640 columns only, row 1 12 tokens in rank 1's only
++    for (0..12) |j| {
++        logits[3 + 17 * j] = random.random().float(f32) * 4 - 2;
++        logits[vocab + 700 + 31 * j] = random.random().float(f32) * 4 - 2;
++    }
++    const positions = [_]u64{ 5, 6 };
++    const s: pipe.Sampling = .{ .seed = 847, .temperature = 0.8, .top_k = 0, .top_p = 0.9 };
++    var got: [3][n]u32 = undefined;
++    var whole: [3][1]usize = undefined;
++    for ([_]u32{ 1, 2, 2 }, [_]u32{ 64, 64, 0 }, 0..) |world, nucleus, i| {
++        var c: Case = .{ .logits = logits, .world = world, .uneven = true, .rows = n, .sampling = s, .nucleus = nucleus, .positions = &positions, .got = &got[i], .whole = &whole[i] };
++        try run(&c);
++    }
++    try testing.expectEqualSlices(u32, &got[0], &got[1]);
++    try testing.expectEqualSlices(u32, &got[2], &got[1]); // nucleus 0: every row picked from all its tokens
++    try testing.expectEqual(@as(usize, 0), whole[1][0]); // the empty slice's (-inf, NaN) statistics gather no whole row
++}
++
+ const Case = struct {
+     logits: []const f32,
+     world: u32,
+diff --git a/zig/src/families/deepseek_v41/serve/sampling.zig b/zig/src/families/deepseek_v41/serve/sampling.zig
+index 3903c558f23..21f2cac3e46 100644
+--- a/zig/src/families/deepseek_v41/serve/sampling.zig
++++ b/zig/src/families/deepseek_v41/serve/sampling.zig
+@@ -176,7 +176,10 @@ pub const Picker = struct {
+         var m: f64 = -std.math.inf(f64);
+         for (stats) |st| m = @max(m, st[0]);
+         var z: f64 = 0;
+-        for (stats) |st| z += st[1] * exp(st[0] / t - m / t);
++        // a rank whose every logit is -inf (a grammar masked its whole slice) adds nothing; its own sum is NaN
++        for (stats) |st| if (st[0] != -std.math.inf(f64)) {
++            z += st[1] * exp(st[0] / t - m / t);
++        };
+         const top: f64 = valueOf(keys[0]);
+         if (n < 2 or !std.math.isFinite(top) or !std.math.isFinite(z) or z <= 0) return null;
+         if (top != m) return null; // the candidates' best is not the row's max
+diff --git a/zig/src/families/deepseek_v41/serve_engine.zig b/zig/src/families/deepseek_v41/serve_engine.zig
+index 44bd8e81bf5..9e19f7dc9ec 100644
+--- a/zig/src/families/deepseek_v41/serve_engine.zig
++++ b/zig/src/families/deepseek_v41/serve_engine.zig
+@@ -146,7 +146,7 @@ pub const Served = struct {
+         s.core = lanes.Engine.init(gpa, &s.cfg, s.x.backend(), s.clock.clock());
+         s.x.attach(&s.core);
+         const window: u32 = @intCast(@min(context orelse m.f.opts.limit, m.f.opts.limit));
+-        s.host = api.LaneHost.init(gpa, io, &s.core, .{ .benchmark_ranks = m.session.nccl.size, .benchmark_group = m.benchmark_group, .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows });
++        s.host = api.LaneHost.init(gpa, io, &s.core, .{ .benchmark_ranks = m.session.nccl.size, .benchmark_group = m.benchmark_group, .name = "dsv41-cuda", .lanes = m.slots, .context_window = window, .prefill_step = m.gt.prefill_rows, .structures = m.grammar != null });
+         s.host.info_.draft_sources = draftSources(m.pass != null, s.cfg.max_copy > 0);
+         // the lanes run on LaneHost's thread: the model's CUDA context must be current there
+         s.host.on_thread = .{ .ctx = m, .run = bindContext };
+diff --git a/zig/src/families/deepseek_v41/target.zig b/zig/src/families/deepseek_v41/target.zig
+index ed62f884d1d..68633bc5f9a 100644
+--- a/zig/src/families/deepseek_v41/target.zig
++++ b/zig/src/families/deepseek_v41/target.zig
+@@ -12,6 +12,7 @@ const branches = @import("draft/branches.zig");
+ const pk = @import("serve_knobs.zig");
+ const ced = @import("ced.zig");
+ const pf = @import("forward_prefill.zig");
++const gg = @import("grammar_gpu.zig");
+ 
+ pub const Error = error{ TreeWindow, Sampling, Slots, NotAChain, WindowRows };
+ 
+@@ -33,6 +34,14 @@ pub const GpuTarget = struct {
+     rows: ?*batch.Batch = null,
+     /// the keyed sampler (model.zig makes it on every rank): sampled choices; null refuses them (error.Sampling)
+     sampler: ?*samp.GpuSampler = null,
++    /// structured output (grammar_gpu.zig, every rank): masked rows staged before their picks; null refuses them
++    grammar: ?*gg.Masks = null,
++    /// each slot's next first token's bits (`first_mask`, taken by its prefill / finish / tail); empty: none
++    first_bits: [16][]const u32 = @splat(&.{}),
++    /// a tree window's masks (its rows') while the resolver runs its chains
++    tree_masks: []const u32 = &.{},
++    tree_rows: usize = 0,
++    masked_trees: u64 = 0, // tree windows with a row the grammar narrows (the tree log line)
+     /// draft trees (`parents`): resolved as chain windows on the slot (draft/branches.zig), the last one kept by path
+     tree: branches.Resolver = .{},
+     /// the DSpark pass the lanes drive: with `.verify`, the prefilled tail's taps go to it before the first window
+@@ -61,19 +70,43 @@ pub const GpuTarget = struct {
+         return .{ .ptr = t, .vtable = &vtable };
+     }
+ 
+-    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .release_checked = releaseChecked, .available = available, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays, .warm = warm };
++    const vtable: iface.Target.VTable = .{ .prefill = prefill, .window = window, .keep = keep, .taps = taps, .release = release, .release_checked = releaseChecked, .available = available, .admit = admit, .begin = begin, .piece = piece, .finish = finish, .tail = tail, .pieces = pieces, .replays = replays, .warm = warm, .first_mask = firstMask };
+ 
+     fn admit(p: *anyopaque, slot: u32, max_new: u64) void {
+         const t = self_(p);
+         if (slot < t.max_new.len) t.max_new[slot] = max_new;
+     }
+ 
++    fn firstMask(p: *anyopaque, slot: u32, bits: []const u32) void {
++        const t = self_(p);
++        if (slot < t.first_bits.len) t.first_bits[slot] = bits;
++    }
++
++    /// The slot's first token's bits, once (empty: none).
++    fn takeFirst(t: *GpuTarget, slot: u32) []const u32 {
++        if (slot >= t.first_bits.len) return &.{};
++        defer t.first_bits[slot] = &.{};
++        return t.first_bits[slot];
++    }
++
++    /// Rank 0, before a forward's picks: its masked rows; none clears what an earlier forward staged.
++    fn stage(t: *GpuTarget, rows: []const gg.Row) !void {
++        const g = t.grammar orelse return if (rows.len > 0) error.StructuresUnsupported else {};
++        try g.stage(rows);
++    }
++
++    /// Before a prompt's pick: its last row `row` drawn among `bits` (empty: unmasked).
++    fn stageLast(t: *GpuTarget, row: u32, bits: []const u32) !void {
++        return t.stage(if (bits.len > 0) &.{.{ .row = row, .bits = bits }} else &.{});
++    }
++
+     fn self_(p: *anyopaque) *GpuTarget {
+         return @ptrCast(@alignCast(p));
+     }
+ 
+     fn prefill(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32 {
+         const t = self_(p);
++        const bits = t.takeFirst(slot);
+         if (!available(p, slot)) return error.SlotUnavailable;
+         if (t.rows) |b| try b.beginPrefill(slot) else if (slot != 0) return error.Slots;
+         _ = t.takeReplayed(slot);
+@@ -106,7 +139,7 @@ pub const GpuTarget = struct {
+             try t.handTaps(slot);
+             var one: [1]u32 = undefined;
+             var out = [_][]u32{&one};
+-            try window(p, &.{.{ .slot = slot, .start = ids.len - sp.window, .tokens = ids[ids.len - sp.window ..], .parents = null, .draws = &.{draw}, .sampling = sampling }}, &out);
++            try window(p, &.{.{ .slot = slot, .start = ids.len - sp.window, .tokens = ids[ids.len - sp.window ..], .parents = null, .draws = &.{draw}, .sampling = sampling, .masks = bits }}, &out);
+             return one[0];
+         }
+         if (t.own_prefill) {
+@@ -114,6 +147,7 @@ pub const GpuTarget = struct {
+             try t.f.prefill(rest);
+             const seg: usize = @import("forward_prefill.zig").segmentRows(t.f);
+             const last = if (rest.len % seg == 0) seg else rest.len % seg;
++            try t.stageLast(@intCast(last - 1), bits);
+             if (keyed) |s| return t.pickOne(@intCast(last - 1), s, draw);
+             const picks = try t.f.gpa.alloc(u32, last);
+             defer t.f.gpa.free(picks);
+@@ -127,6 +161,7 @@ pub const GpuTarget = struct {
+             try t.f.window(ids[at_ .. at_ + n]);
+             if (at_ + n == ids.len) {
+                 // the keyed choice after the prompt's last row: the last row's greedy pick, or its sampled one
++                try t.stageLast(@intCast(n - 1), bits);
+                 if (keyed) |s| choice[0] = try t.pickOne(@intCast(n - 1), s, draw) else {
+                     var rows: [64]u32 = undefined;
+                     try t.f.greedy(rows[0..n]);
+@@ -196,6 +231,7 @@ pub const GpuTarget = struct {
+ 
+     fn finish(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!u32 {
+         const t = self_(p);
++        const bits = t.takeFirst(slot);
+         try t.onSlot(slot);
+         if (ids.len == 0 or t.f.slot.pos != ids.len - 1) return error.NotAChain;
+         if (pf.state(t.f).mode == .replay and !t.takeReplayed(slot)) {
+@@ -206,7 +242,7 @@ pub const GpuTarget = struct {
+         }
+         var one: [1]u32 = undefined;
+         var out = [_][]u32{&one};
+-        try window(p, &.{.{ .slot = slot, .start = ids.len - 1, .tokens = ids[ids.len - 1 ..], .parents = null, .draws = &.{draw}, .sampling = sampling }}, &out);
++        try window(p, &.{.{ .slot = slot, .start = ids.len - 1, .tokens = ids[ids.len - 1 ..], .parents = null, .draws = &.{draw}, .sampling = sampling, .masks = bits }}, &out);
+         return one[0];
+     }
+ 
+@@ -258,6 +294,7 @@ pub const GpuTarget = struct {
+     fn tail(p: *anyopaque, slot: u32, ids: []const u32, sampling: ?lanes.Sampling, draw: u64) anyerror!?u32 {
+         _ = draw;
+         const t = self_(p);
++        _ = t.takeFirst(slot); // the first token comes from the round's window, its bits the lane core's
+         try t.onSlot(slot);
+         if (ids.len == 0 or t.f.slot.pos != ids.len - 1) return error.NotAChain;
+         _ = try t.keyedOf(sampling); // refused here as `finish` would, not in the round
+@@ -280,11 +317,17 @@ pub const GpuTarget = struct {
+ 
+     fn window(p: *anyopaque, segments: []const iface.Segment, choices: [][]u32) anyerror!void {
+         const t = self_(p);
+-        if (t.rows) |b| return b.targetWindow(segments, choices, t.sampler);
++        if (t.rows) |b| return b.targetWindow(segments, choices, t.sampler, t.grammar);
+         if (segments.len != 1) return error.Slots;
+         const s = segments[0];
+         if (s.slot != 0) return error.Slots;
+-        if (s.parents != null) return t.tree.window(.{ .ptr = t, .vtable = &chains }, s, choices[0]);
++        if (s.parents != null) {
++            t.tree_masks = s.masks;
++            t.tree_rows = s.tokens.len;
++            defer t.tree_masks = &.{};
++            defer t.noteTree(!gg.allowsAll(s.masks)); // a row the grammar narrows (empty masks allow all)
++            return t.tree.window(.{ .ptr = t, .vtable = &chains }, s, choices[0]);
++        }
+         t.tree.clear();
+         const keyed = try t.keyedOf(s.sampling);
+         // a chain window never kept keeps every row: the lanes' undrafted step sends the next row without a keep
+@@ -294,6 +337,8 @@ pub const GpuTarget = struct {
+         }
+         if (s.start != t.f.slot.pos) return error.NotAChain;
+         if (s.tokens.len > t.max_rows) return error.WindowRows;
++        var masked: [gg.max_rows]gg.Row = undefined;
++        try t.stage(try gg.segmentRows(&masked, &.{s}));
+         try t.f.window(s.tokens);
+         if (keyed) |smp| return t.sampler.?.choose(0, @intCast(s.tokens.len), smp, s.draws, choices[0][0..s.tokens.len]);
+         try t.f.greedy(choices[0][0..s.tokens.len]);
+@@ -404,8 +449,29 @@ pub const GpuTarget = struct {
+     const chains: branches.Chains.VTable = .{ .run = chainRun, .drop = chainDrop };
+ 
+     fn chainRun(p: *anyopaque, slot: u32, start: u64, tokens: []const u32, draws: []const u64, sampling: ?lanes.Sampling, out: []u32) anyerror!void {
++        const t = self_(p);
+         var one = [_][]u32{out};
+-        return window(p, &.{.{ .slot = slot, .start = start, .tokens = tokens, .parents = null, .draws = draws, .sampling = sampling }}, &one);
++        const masks = try t.chainMasks(tokens.len);
++        defer t.f.gpa.free(masks);
++        return window(p, &.{.{ .slot = slot, .start = start, .tokens = tokens, .parents = null, .draws = draws, .sampling = sampling, .masks = masks }}, &one);
++    }
++
++    /// TF_DSV41_TREE: the tree windows so far, logged at the first, the first under a grammar and every 256th.
++    fn noteTree(t: *GpuTarget, masked: bool) void {
++        t.masked_trees += @intFromBool(masked);
++        const st = t.tree.stats;
++        if (st.trees != 1 and st.trees % 256 != 0 and !(masked and t.masked_trees == 1)) return;
++        std.log.scoped(.dsv41).info("tree windows: {d} ({d} under a grammar), {d} chains, {d} rows run again", .{ st.trees, t.masked_trees, st.chains, st.rerun_rows });
++    }
++
++    /// A tree chain's bits: chain row i takes the tree row the resolver put there (empty without a grammar).
++    fn chainMasks(t: *GpuTarget, n: usize) ![]u32 {
++        if (t.tree_masks.len == 0) return &.{};
++        if (t.tree_rows == 0 or t.tree_masks.len % t.tree_rows != 0) return error.InvalidGrammarMasks;
++        const words = t.tree_masks.len / t.tree_rows;
++        const out = try t.f.gpa.alloc(u32, n * words);
++        for (t.tree.rows[0..n], 0..) |row, i| @memcpy(out[i * words ..][0..words], t.tree_masks[@as(usize, row) * words ..][0..words]);
++        return out;
+     }
+ 
+     fn chainDrop(p: *anyopaque, slot: u32) anyerror!void {
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 24fa9d58c84..3039ca97944 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -271,7 +271,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
+     };
+     srv.release(preparing, null); // a background request waits only while a foreground one prepares
+     preparing = false;
+-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .asked = input.cancel, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{ .positions = if (sink) |s| s.tokens != null else false } else null, .loop_stop = request.loop_stop, .single = flag(input.fields, "tool_call_single") orelse false };
++    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .asked = input.cancel, .reply_id = input.id, .seed = if (request.sampling) |v| v.seed else null, .sink = sink, .thinking = prepared.reasoning or (srv.text.vtable.format != .kimi and srv.info.capability(.reasoning) and reply_text.isChannel(srv.markers)), .chat = input.prompt == null, .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .grammar = if (request.structure) |st| (if (st.after) |t| .{ .after = t } else .on) else .none, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = prepared.token_ids, .lp = if (request.logprobs != null) .{ .positions = if (sink) |s| s.tokens != null else false } else null, .loop_stop = request.loop_stop, .single = flag(input.fields, "tool_call_single") orelse false };
+     defer srv.noteRequest(prepared.prompt_len, cached_tokens.within(box.cached, prepared.prompt_len), gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds, if (box.stats.prefill_seconds != null) box.stats.queued_seconds else null);
+     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
+     const result: Failure!Reply = blk: {
+diff --git a/zig/src/server/chat_generation.zig b/zig/src/server/chat_generation.zig
+index 137db952be5..052bbc093e9 100644
+--- a/zig/src/server/chat_generation.zig
++++ b/zig/src/server/chat_generation.zig
+@@ -50,6 +50,7 @@ pub const Generation = struct {
+     chat: bool = true,
+     stops: reply_text.Stops,
+     ignore_eos: bool,
++    grammar: @import("eos_phase.zig").Phase = .none, // the request's grammar at the next token to commit
+     max_tokens: u32,
+     single: bool, // parallel_tool_calls: false: a cut call is no call, so its prose ends as the whole reply's does
+     token_ids: bool, // "return_token_ids": the response's tensorfold block carries the reply's token ids
+@@ -73,7 +74,7 @@ pub const Generation = struct {
+     loop_stop: bool = false, // --loop-guard-stop: the engine ends the reply where the loop guard fires
+ 
+     fn eos(g: *const Generation, t: u32) bool {
+-        return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
++        return g.grammar.ends(g.ignore_eos, g.srv.eos, t);
+     }
+ 
+     /// Close a tool call left open at the model end token, except when another stop condition ended the reply.
+@@ -95,6 +96,7 @@ pub const Generation = struct {
+ 
+     /// Commits a round's tokens as ``LaneStream.commit`` would, then streams what they add.
+     fn commit(g: *Generation, chunk: []const u32) Failure!void {
++        const before = g.grammar; // the stream below judges each token's end at its own phase, as this loop does
+         var landed: usize = 0;
+         for (chunk) |t| {
+             if (g.reason != null) break;
+@@ -106,6 +108,7 @@ pub const Generation = struct {
+                 g.reason = "stop";
+                 g.srv.engine.cancel(g.id); // the engine ends EOS and length itself; a stop string is the server's
+             } else if (g.collected.items.len >= g.max_tokens) g.reason = "length";
++            g.grammar = g.grammar.next(t); // thinking on: the grammar takes the reply from the token after `</think>`
+         }
+         if (landed == 0) return;
+         const arrived = nowNs(g.srv.io);
+@@ -120,17 +123,11 @@ pub const Generation = struct {
+             g.wrote_ns = nowNs(g.srv.io);
+         }
+         if (g.streaming_done) return;
+-        var fresh: std.ArrayList(u32) = .empty;
+-        for (chunk[0..landed]) |t| {
+-            if (g.eos(t)) {
+-                g.streaming_done = true;
+-                break;
+-            }
+-            try fresh.append(g.a, t);
+-        }
++        const fresh = @import("eos_phase.zig").streamed(before, g.ignore_eos, g.srv.eos, chunk[0..landed]);
++        if (fresh.ended) g.streaming_done = true;
+         const live = g.liveRows();
+-        if (live) |l| try l.add(g.srv, g.a, fresh.items);
+-        const all = try g.visible.extend(g.a, g.srv.text, reply_text.decodeText, fresh.items);
++        if (live) |l| try l.add(g.srv, g.a, fresh.tokens);
++        const all = try g.visible.extend(g.a, g.srv.text, reply_text.decodeText, fresh.tokens);
+         if (g.visible.pending()) return; // a character still split across tokens
+         if (g.srv.text.vtable.format == .kimi) return @import("chat_kimi.zig").stream(g, sink);
+         const raw_visible = g.stops.visible(all, true);
+@@ -274,7 +271,7 @@ pub const Generation = struct {
+         const stopped: ?u32 = if (g.loop_stop) m.stats.loop_period else null;
+         const reason = if (stopped != null) @import("loop_stop.zig").finish_reason else ended;
+         const finished_ns = nowNs(g.srv.io);
+-        const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
++        const content_tokens = if (g.grammar.keepsTrailing(g.ignore_eos)) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
+         const raw = try g.srv.text.decode(a, content_tokens);
+         const native = if (g.srv.text.vtable.format == .kimi) try @import("chat_kimi.zig").read(g, content_tokens, true) else null;
+         const raw_visible = g.stops.visible(raw, false);
+diff --git a/zig/src/server/eos_phase.zig b/zig/src/server/eos_phase.zig
+new file mode 100644
+index 00000000000..e98e134bd61
+--- /dev/null
++++ b/zig/src/server/eos_phase.zig
+@@ -0,0 +1,94 @@
++//! A reply's end tokens under its grammar: with ignore_eos only an end token that the grammar takes ends the reply.
++const std = @import("std");
++
++/// The request's grammar at the next token: none, waiting for the token after `after` (thinking on), or on.
++pub const Phase = union(enum) {
++    none,
++    after: u32,
++    on,
++
++    /// The phase at the token after `t`.
++    pub fn next(p: Phase, t: u32) Phase {
++        return switch (p) {
++            .after => |end| if (t == end) .on else p,
++            else => p,
++        };
++    }
++
++    /// Whether `t`, at this phase, ends the reply: any end token, and with ignore_eos only one under the grammar.
++    pub fn ends(p: Phase, ignore_eos: bool, eos: []const u32, t: u32) bool {
++        return (!ignore_eos or p == .on) and std.mem.indexOfScalar(u32, eos, t) != null;
++    }
++
++    /// Whether the reply keeps a trailing end token as content: the negation of `ends`' condition.
++    pub fn keepsTrailing(p: Phase, ignore_eos: bool) bool {
++        return ignore_eos and p != .on;
++    }
++};
++
++/// A chunk's tokens that stream, and whether one of them ended the reply (it does not stream).
++pub const Streamed = struct { tokens: []const u32, ended: bool };
++
++/// A chunk's tokens that stream from `phase`: up to the first that ends the reply, each judged at its own phase.
++pub fn streamed(phase: Phase, ignore_eos: bool, eos: []const u32, chunk: []const u32) Streamed {
++    var p = phase;
++    for (chunk, 0..) |t, i| {
++        if (p.ends(ignore_eos, eos, t)) return .{ .tokens = chunk[0..i], .ended = true };
++        p = p.next(t);
++    }
++    return .{ .tokens = chunk, .ended = false };
++}
++
++test "EOS policy: a chunk's end token is judged at its own grammar phase, so one before the grammar streams" {
++    const eos = [_]u32{2};
++    const close: u32 = 9; // `</think>`: the grammar takes the reply from the next token
++    // thinking on, ignore_eos: an end token in the reasoning, the think end, the answer, then the grammar's stop
++    const chunk = [_]u32{ 5, 2, close, 7, 2, 8 };
++    const got = streamed(.{ .after = close }, true, &eos, &chunk);
++    try std.testing.expect(got.ended);
++    try std.testing.expectEqualSlices(u32, chunk[0..4], got.tokens);
++    // the chunk's last phase judging every token would end the stream at the reasoning's end token instead
++    var last: Phase = .{ .after = close };
++    for (chunk) |t| last = last.next(t);
++    try std.testing.expect(last == .on and last.ends(true, &eos, chunk[1]));
++    const wrong = streamed(last, true, &eos, &chunk);
++    try std.testing.expectEqualSlices(u32, chunk[0..1], wrong.tokens);
++}
++
++test "EOS policy: the content tokens keep a trailing end token exactly when it does not end the reply" {
++    const eos = [_]u32{ 2, 3 };
++    const t: u32 = 2; // an end token
++    // keepsTrailing is the negation of the condition ends applies, at every phase and either ignore_eos.
++    for ([_]Phase{ .none, .{ .after = 9 }, .on }) |p| {
++        for ([_]bool{ false, true }) |ignore_eos| {
++            try std.testing.expectEqual(!p.ends(ignore_eos, &eos, t), p.keepsTrailing(ignore_eos));
++        }
++    }
++    // The case this pins: with ignore_eos, a grammar's own stop ends the reply, so it is not content.
++    const on: Phase = .on;
++    const none: Phase = .none;
++    const waiting: Phase = .{ .after = 9 };
++    try std.testing.expect(!on.keepsTrailing(true));
++    try std.testing.expect(none.keepsTrailing(true));
++    try std.testing.expect(waiting.keepsTrailing(true));
++    // Without ignore_eos nothing keeps a trailing end token.
++    for ([_]Phase{ .none, .{ .after = 9 }, .on }) |p| try std.testing.expect(!p.keepsTrailing(false));
++}
++
++test "EOS policy: without ignore_eos any end token ends the stream; without a grammar ignore_eos keeps them all" {
++    const eos = [_]u32{ 2, 3 };
++    const chunk = [_]u32{ 5, 3, 2 };
++    for ([_]Phase{ .none, .{ .after = 9 }, .on }) |p| {
++        const got = streamed(p, false, &eos, &chunk);
++        try std.testing.expect(got.ended);
++        try std.testing.expectEqualSlices(u32, chunk[0..1], got.tokens);
++    }
++    for ([_]Phase{ .none, .{ .after = 9 } }) |p| {
++        const kept = streamed(p, true, &eos, &chunk);
++        try std.testing.expect(!kept.ended);
++        try std.testing.expectEqualSlices(u32, &chunk, kept.tokens);
++    }
++    const on = streamed(.on, true, &eos, &chunk);
++    try std.testing.expect(on.ended);
++    try std.testing.expectEqualSlices(u32, chunk[0..1], on.tokens);
++}
+diff --git a/zig/src/server/hf_eos_http_test.zig b/zig/src/server/hf_eos_http_test.zig
+index c165972615c..6064cad196a 100644
+--- a/zig/src/server/hf_eos_http_test.zig
++++ b/zig/src/server/hf_eos_http_test.zig
+@@ -1,6 +1,7 @@
+ //! Actual HfText and OpenAI HTTP-handler EOS paths with an inert scripted engine, without sockets or a GPU.
+ const std = @import("std");
+ const api = @import("engine_api");
++const lanes = @import("lanes");
+ const json = @import("json");
+ const HfText = @import("hf_text.zig").HfText;
+ const fixture = @import("hf_eos_fixture.zig");
+@@ -16,21 +17,38 @@ const Script = struct {
+     seen_eos: []const u32 = &.{},
+     seen_prompt: []const u32 = &.{},
+     reasoning: bool = true,
++    reason: api.Reason = .length,
++    chunk: usize = 0, // tokens an event (0: all in one)
++    logprobs: bool = false,
++    structured: bool = false, // the request carried a grammar
++    after: ?u32 = null, // the token the grammar starts after
+ 
+     fn engine(s: *Script) api.Engine {
+         return .{ .ctx = s, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
+     }
+     fn info(ctx: *anyopaque) api.Info {
+         const s: *Script = @ptrCast(@alignCast(ctx));
+-        return .{ .context_window = 262144, .reasoning = s.reasoning };
++        return .{ .context_window = 262144, .reasoning = s.reasoning, .logprobs = s.logprobs };
+     }
+     fn submit(ctx: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
+         const s: *Script = @ptrCast(@alignCast(ctx));
+         s.seen_eos = s.a.dupe(u32, request.eos) catch return error.Busy;
+         s.seen_prompt = s.a.dupe(u32, request.prompt) catch return error.Busy;
++        s.structured = request.structure != null;
++        if (request.structure) |st| s.after = st.after;
+         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
+-        sink.event(sink.ctx, id, &.{ .tokens = s.ids });
+-        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .length } });
++        const step = if (s.chunk == 0) s.ids.len else s.chunk;
++        var at: usize = 0;
++        while (at < s.ids.len) : (at += step) {
++            const part = s.ids[at..@min(s.ids.len, at + step)];
++            if (request.logprobs != null) {
++                const rows = s.a.alloc(api.LogprobRow, part.len) catch return error.Busy;
++                for (part, rows, at..) |token, *row, i| row.* = .{ .token = token, .logprob = -@as(f32, @floatFromInt(i + 1)) / 4 };
++                sink.event(sink.ctx, id, &.{ .logprobs = rows });
++            }
++            sink.event(sink.ctx, id, &.{ .tokens = part });
++        }
++        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = s.reason } });
+     }
+     fn cancel(_: *anyopaque, _: api.Id) void {}
+     fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
+@@ -141,6 +159,139 @@ test "EOS policy: HTTP preserves ordinary answer text before either declared EOS
+         try check(first, true, false, streaming, true);
+ }
+ 
++/// One structured chat reply with ignore_eos, on the DeepSeek-V4.1 test tokenizer, `chunk` tokens an event.
++fn grammarStop(thinking: bool, streaming: bool, chunk: usize, rows: bool) !void {
++    const gpa = std.testing.allocator;
++    const io = std.testing.io;
++    var arena = std.heap.ArenaAllocator.init(gpa);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var f = try fixture.Fixture.init(gpa, io, null);
++    defer f.deinit();
++    const vocab = try std.Io.Dir.cwd().readFileAlloc(io, "zig/src/families/deepseek_v41/fixtures/serve/mini_tokenizer.json", a, .limited(1 << 20));
++    // a Fuse decoder: without one its pieces decode joined by spaces
++    const fused = try std.mem.replaceOwned(u8, a, vocab, "{\"version\": \"1.0\",", "{\"version\": \"1.0\", \"decoder\": {\"type\": \"Fuse\"},");
++    try f.tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = fused });
++    try f.tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"deepseek_v41\"}" });
++    try f.tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"eos_token\":\"<｜end▁of▁sentence｜>\"}" });
++    var problem: []const u8 = "";
++    const text = try HfText.load(gpa, io, f.path, null, a, &problem);
++    defer text.deinit();
++    const fake = lanes.grammar_fake;
++    const old = fake.install();
++    defer _ = lanes.grammar.swapLibrary(old);
++    var compiler = fake.compiler();
++    // the lane core ends the reply on the grammar's stop token; with thinking on, an end token before `</think>` stays
++    const end = text.text().tokenId("<｜end▁of▁sentence｜>").?;
++    const close = text.text().tokenId("</think>").?;
++    const reply = [_]u32{ 'h', 'm', end, 'o', 'k', close, '{', '}', end };
++    const ids: []const u32 = if (thinking) &reply else reply[6..];
++    var script = Script{ .a = a, .ids = ids, .reason = .stop, .chunk = chunk, .logprobs = rows };
++    const srv = try Server.init(gpa, io, script.engine(), text.text(), .{
++        .served_name = "m",
++        .model_ids = &.{"m"},
++        .enable_thinking = thinking,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    srv.info.structures = true;
++    srv.grammars = &compiler;
++    const body = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"messages\":[{{\"role\":\"user\",\"content\":\"H\"}}],\"max_tokens\":{d},\"stream\":{},\"ignore_eos\":true,\"response_format\":{{\"type\":\"json_object\"}}}}", .{ ids.len, streaming }))).ok;
++    if (rows) {
++        try body.object.put(a, "logprobs", .{ .bool = true });
++        try body.object.put(a, "return_token_ids", .{ .bool = true });
++    }
++    var conn = Conn{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
++    var response = Reply{ .a = a };
++    openai.run(srv, a, response.out(), .{ .conn = &conn }, true, body);
++    var content: std.ArrayList(u8) = .empty;
++    var reasoning: std.ArrayList(u8) = .empty;
++    var final: ?json.Value = response.whole;
++    var prose_rows: std.ArrayList(json.Value) = .empty;
++    var thought_rows: std.ArrayList(json.Value) = .empty;
++    var pieces: [2]usize = .{ 0, 0 }; // reasoning and content deltas
++    if (streaming) {
++        try std.testing.expect(response.opened and response.done and response.whole == null);
++        for (response.events.items) |value| {
++            const choices = value.get("choices") orelse continue;
++            if (choices.array.len == 0) continue;
++            const choice = choices.array[0];
++            if (choice.get("delta")) |d| {
++                const said: [2][]const u8 = .{ d.strField("reasoning_content") orelse "", d.strField("content") orelse "" };
++                try reasoning.appendSlice(a, said[0]);
++                try content.appendSlice(a, said[1]);
++                for (&pieces, said) |*n, x| n.* += @intFromBool(x.len > 0);
++            }
++            if (choice.get("logprobs")) |lp| {
++                try prose_rows.appendSlice(a, lp.get("content").?.array);
++                if (lp.get("reasoning_content")) |r| try thought_rows.appendSlice(a, r.array);
++            }
++            if (choice.get("finish_reason")) |reason| {
++                if (reason == .string) final = value;
++            }
++        }
++        // each event's text streams with it, none left to the finish: one delta for each event that adds some
++        const step = if (chunk == 0) ids.len else chunk;
++        const answer_at: usize = if (thinking) 6 else 0;
++        try std.testing.expectEqual(if (thinking) (4 / step) + 1 else 0, pieces[0]);
++        try std.testing.expectEqual(((answer_at + 1) / step) - (answer_at / step) + 1, pieces[1]);
++    } else {
++        try std.testing.expectEqual(@as(?u16, 200), response.status);
++        const message = response.whole.?.get("choices").?.array[0].get("message").?;
++        try content.appendSlice(a, message.strField("content") orelse "");
++        try reasoning.appendSlice(a, message.strField("reasoning_content") orelse "");
++    }
++    if (rows and !streaming) {
++        const lp = response.whole.?.get("choices").?.array[0].get("logprobs").?;
++        try prose_rows.appendSlice(a, lp.get("content").?.array);
++        if (lp.get("reasoning_content")) |r| try thought_rows.appendSlice(a, r.array);
++    }
++    if (rows) {
++        try std.testing.expectEqual(@as(usize, 2), prose_rows.items.len);
++        try std.testing.expectEqual(@as(usize, if (thinking) 5 else 0), thought_rows.items.len);
++        const answer_at: usize = if (thinking) 6 else 0;
++        for (prose_rows.items, answer_at..) |row, i| {
++            const bytes = row.get("bytes").?.array;
++            const expected = (try text.text().tokenBytes(a, ids[i])).?;
++            try std.testing.expectEqual(expected.len, bytes.len);
++            for (bytes, expected) |byte, want| try std.testing.expectEqual(@as(i64, want), byte.int64().?);
++            try std.testing.expectEqual(-@as(f64, @floatFromInt(i + 1)) / 4, row.get("logprob").?.float);
++        }
++        for (thought_rows.items, 0..) |row, i| {
++            const bytes = row.get("bytes").?.array;
++            const expected = (try text.text().tokenBytes(a, ids[i])).?;
++            try std.testing.expectEqual(expected.len, bytes.len);
++            for (bytes, expected) |byte, want| try std.testing.expectEqual(@as(i64, want), byte.int64().?);
++            try std.testing.expectEqual(-@as(f64, @floatFromInt(i + 1)) / 4, row.get("logprob").?.float);
++        }
++    }
++    const value = final orelse return error.MissingFinalReply;
++    if (rows) {
++        const got = value.get("tensorfold").?.get("token_ids").?.array;
++        try std.testing.expectEqual(ids.len, got.len);
++        for (got, ids) |id, expected| try std.testing.expectEqual(@as(i64, expected), id.int64().?);
++    }
++    try std.testing.expect(script.structured);
++    try std.testing.expectEqual(@as(?u32, if (thinking) close else null), script.after);
++    try std.testing.expectEqualSlices(u32, &.{}, script.seen_eos);
++    try std.testing.expectEqualSlices(u32, &.{end}, srv.eos);
++    try std.testing.expectEqualStrings("{}", content.items);
++    try std.testing.expectEqualStrings(if (thinking) "hm<｜end▁of▁sentence｜>ok" else "", reasoning.items);
++    try std.testing.expectEqualStrings("stop", json.strOr(value.get("choices").?.array[0].get("finish_reason")));
++    try std.testing.expectEqual(@as(i64, @intCast(ids.len)), value.get("usage").?.get("completion_tokens").?.int64().?);
++}
++
++test "EOS policy: with ignore_eos a grammar's stop token ends the reply outside its text, and an earlier end token stays" {
++    // every chunk size: the reasoning's end token, `</think>` and the grammar's stop land together or apart
++    for ([_]bool{ false, true }) |thinking| for ([_]bool{ false, true }) |streaming| for (0..10) |chunk|
++        try grammarStop(thinking, streaming, chunk, false);
++}
++
++test "EOS policy: grammar stops preserve current whole and live logprob rows across every chunk boundary" {
++    for ([_]bool{ false, true }) |thinking| for ([_]bool{ false, true }) |streaming| for (0..10) |chunk|
++        try grammarStop(thinking, streaming, chunk, true);
++}
++
+ fn tokenIds(streaming: bool, asked: bool) !void {
+     const gpa = std.testing.allocator;
+     const io = std.testing.io;
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 29be9a21bd3..fbe3b9ae8a0 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -164,6 +164,7 @@ test {
+     _ = @import("cancel_ids.zig");
+     _ = @import("cancel_route_test.zig");
+     _ = @import("hf_eos_http_test.zig");
++    _ = @import("eos_phase.zig");
+     _ = @import("token_stream_test.zig");
+     _ = @import("reply_gpu_seconds_test.zig");
+     _ = @import("spark_wire.zig");

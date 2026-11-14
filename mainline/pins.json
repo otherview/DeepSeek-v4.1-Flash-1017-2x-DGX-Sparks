@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "mia_base": "c7f2b85100f0a7b099c92a4e21825e30d93c9c51",
+  "tensorfold": {
+    "repository": "ashhart/TensorFold",
+    "revision": "2ba55ec7d32d0bec446bb012678550be7ef52895",
+    "url": "https://codeload.github.com/ashhart/TensorFold/tar.gz/2ba55ec7d32d0bec446bb012678550be7ef52895",
+    "sha256": "42a20e8c4f737b39495be5e69ecf0622ce7349e6a016b37ee7ee122d653642a0",
+    "archive_bytes": 37699848
+  },
+  "compiler": {
+    "version": "0.17.0",
+    "url": "https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz",
+    "archive_sha256": "9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8",
+    "binary_sha256": "5165c9a2d17938a8173839b3adf81d025b558d38d9e9711237a6fa5b8d8bb3f7"
+  },
+  "cpu_builder": "python@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df",
+  "cuda_builder": "nvcr.io/nvidia/pytorch@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c",
+  "reference": {
+    "repository": "jayleaton/deepseek-v41-tensorfold-spark",
+    "revision": "6fabbdd66be99acfbb883fb88a689f347ff47bd5",
+    "purpose": "Build-time Triton signatures/options, CPU RoPE tables and Engram preparation only; never Python inference",
+    "triton": "3.7.1",
+    "ptxas": "13.3.73"
+  },
+  "patches": [
+    {
+      "file": "patches/3026.patch",
+      "pull_request": "https://github.com/ashhart/TensorFold/pull/3026",
+      "base": "2ba55ec7d32d0bec446bb012678550be7ef52895",
+      "head": "c9997e7c0628ca0b42a2adb3be3dac1b3ac17335",
+      "sha256": "72b14dc2ea93a6c548b2490646655f92d17743ad289f4d614cbd87cbb53f96b4",
+      "authors": [
+        "ashhart",
+        "nuk3s"
+      ],
+      "commits": [
+        "4192149a9481977e640dea4e6ba01f7e6bb02a9a",
+        "502d58565ed83702017b9dbe6a8e4f3813f88651",
+        "ebba8a14c67245aa7686cbe7e002fcfafe744aef",
+        "bcd5dbc7d6e3ddf3ea87fa1334df7ee4ddd531cf",
+        "4ce8f209219bdd5ccc21c43617268eacd76adfd0",
+        "aa8b51c2f882223ac53aa1e57bede5dff89eab59",
+        "3791607837e5e231fb379d4e5b7350ca3f1ffe28",
+        "205d7d6c62de13e753dd30e9762adaf4254bac35",
+        "8ce4821ab84e43da4b161d9808f52b07a9e615e7",
+        "9623da6b67a38d61b32c831f128ba04a06a6f4c0",
+        "e48aa282ed143fb2e6fd08adf295aca83b3324d8",
+        "de1f3aa6720d200af742ab46ad431598d0528448",
+        "c9997e7c0628ca0b42a2adb3be3dac1b3ac17335"
+      ]
+    },
+    {
+      "file": "patches/3388.patch",
+      "pull_request": "https://github.com/ashhart/TensorFold/pull/3388",
+      "base": "2ba55ec7d32d0bec446bb012678550be7ef52895",
+      "head": "baa16b1e525dcd28e9f324f19a3fc5aafe3493df",
+      "sha256": "7031c2511e9001d877f171d9e00a36c7621a20f2774a5ce5927b53fb70b41971",
+      "authors": [
+        "sx4im"
+      ],
+      "commits": [
+        "baa16b1e525dcd28e9f324f19a3fc5aafe3493df"
+      ]
+    }
+  ],
+  "grammar": {
+    "repository": "mlc-ai/xgrammar",
+    "tag": "v0.2.8",
+    "revision": "97787376faee5ed8466cfad57c99855e4ce2f6aa"
+  }
+}
