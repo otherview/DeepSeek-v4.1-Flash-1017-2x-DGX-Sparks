@@ -1,0 +1,87 @@
+{
+  "status": "Offline image and provisional AOT prepared; model-bound assets, native cache/lifecycle migration and GPU gates remain",
+  "tensorfold": "2ba55ec7d32d0bec446bb012678550be7ef52895",
+  "native_binaries_unchanged": true,
+  "generator_image": {
+    "tag": "tensorfold-dsv41:mainline-2ba55ec7-assets",
+    "local_image_id": "sha256:dd6bfa6c2cd6691c86f3b450057264b44478c429c0cb3b09dc08657d071db28f",
+    "runtime_config_sha256": "e5b2017ba184b0c831527e6a4e6380fc8e63143b7385b54511743b7fbebd5887"
+  },
+  "image_archive": {
+    "bytes": 11701809186,
+    "sha256": "f28debafd0b77cec622618f5c4f100a5f9119b280fd2843649646b472f57505f"
+  },
+  "archive_verification": {
+    "archive_sha256": "f28debafd0b77cec622618f5c4f100a5f9119b280fd2843649646b472f57505f",
+    "gzip_crc_verified": true,
+    "all_layers_present": true,
+    "layers": 78,
+    "runtime_identity_verified": true,
+    "docker_load_performed": false,
+    "production_operations": []
+  },
+  "asset_archive": {
+    "archive": "candidate-assets.tar.gz",
+    "sha256": "3718190bec43187cf675e7efe39bcd27ec5a6bb333f892b57d48cd3d4556af78",
+    "bytes": 2917998,
+    "source_receipt_sha256": "817235dd7009ebd360830634b660e345001e46f62ac8c24fa3e92c83a66a4832",
+    "model_bound": false,
+    "gpu_qualified": false
+  },
+  "aot": {
+    "signature_kernels": 88,
+    "native_signature_fixture_equal": true,
+    "variants_per_rank": [
+      130,
+      130
+    ],
+    "compiled": 130,
+    "failed": 0,
+    "repeat_had_per_rank": [
+      130,
+      130
+    ],
+    "profile_sha256": "07199fd755eddff0a138677678cb155aff0faf05e216ba715000e41bb4ee77f1",
+    "checkpoint_qualified": false,
+    "gpu_qualified": false
+  },
+  "generator_smoke": {
+    "binaries": {
+      "bin/tensorfold-dsv41": "fd683e0368f57b86e9feb9cdd8d9b65130ee6dbea849471de35b0f48f3856c00",
+      "bin/tf-dsv41": "69da6edada2bfcba29bd79ef7de06170b8d6cb75364f00e46a72d0c347421e45",
+      "bin/tf-dsv41-assets": "dc32ecdfdb5f990709cb9eec311cc69d22261e67c96c393a0215c97cdc428af6",
+      "bin/tf-dsv41-token-map": "a106e5fd9e2f1fc8eb8f92d7a9916a441b40604d1774baf6cd56a688a21f0993",
+      "native/lib/libtfgrammar.so": "50474c13ef23a0728b3d7474bbee8d6fa70704f797797764974a0b6e05e19b06"
+    },
+    "cpu_rope_fixture_shapes": [
+      [
+        16,
+        64
+      ],
+      [
+        16,
+        64
+      ]
+    ],
+    "packages": {
+      "torch": "2.13.0a0+9186a08b2c.nv26.7.59513937",
+      "triton": "3.7.1+gitf797708c.nv26.7",
+      "numpy": "2.1.0",
+      "safetensors": "0.8.0"
+    }
+  },
+  "migration_safety_tests": {
+    "passed": 10,
+    "failed": 0
+  },
+  "production_operations": [],
+  "remote_operations": [],
+  "deferred": [
+    "Derived checkpoint/tokenizer identity and metadata (pinned public config fetch returned HTTP 404; no substitution)",
+    "Host-specific RoPE, token-map, native Engram/prepared-weight staging",
+    "Native persistent session cache recovery, 24-hour expiry and 3.5 GiB read/write policy compatibility",
+    "Base launcher and two-rank rollback integration after cache policy reconciliation",
+    "GPU correctness, memory bounds, concurrency, performance and guard continuation"
+  ],
+  "cached_rebuild_runtime_identity_verified": true
+}

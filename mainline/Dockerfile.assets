@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1
+# Local, already-verified native build. offline.py validates its source label.
+FROM tensorfold-dsv41:mainline-2ba55ec7
+COPY reference-tools/ /opt/mainline-generators/
+COPY python-reference/ /opt/mainline-python-reference/
+COPY pins.json /opt/mainline-generators/pins.json
+ENV PYTHONPATH=/opt/mainline-python-reference/src
+ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+ENV TRITON_PTXAS_BLACKWELL_PATH=/usr/local/cuda/bin/ptxas
+LABEL tf.mainline.generators=6fabbdd66be99acfbb883fb88a689f347ff47bd5
+# Runtime CMD remains help. Adding generators never starts a model.

@@ -23,7 +23,7 @@
   "summary": "29/29 steps succeeded; 345/346 tests passed (1 skipped)",
   "host_log_sha256": "59d5f54ce6eddfdd7b747c2c2a4f871ae4b81c38de3250972b6e2c49d66e7b57",
   "migration_safety_tests": {
-    "passed": 6,
+    "passed": 10,
     "failed": 0
   },
   "tools": {

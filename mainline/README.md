@@ -48,7 +48,7 @@ silently. `host-build` uses a bounded CPU-only Linux ARM64 container (two CPUs,
 3 GiB, runc, no network, GPU or model mounts). Compiler bytes must match the lock.
 
 The CPU asset tools actually built, and the selected asset/token-map/draft/
-forward host checks passed: **29/29 steps, 345 passed, 1 skipped**. Six migration
+forward host checks passed: **29/29 steps, 345 passed, 1 skipped**. Ten migration
 safety tests pass. See `VALIDATION.json`. These scoped checks are not the complete
 TensorFold host/golden suite or real-model/device qualification.
 
@@ -79,8 +79,8 @@ run, and `libtfgrammar.so` loads. The real-library tool-grammar and budget suite
 Image and binary hashes are in `VALIDATION.json`.
 The initial build rejected a custom version override; the Dockerfile now uses
 upstream version handling (reports 1.2.9), with the exact source identity carried
-by the pinned revision and image labels. The image is local only, approximately
-11.75 GB in Docker's reported size, with source/compiler caches included. No image
+by the pinned revision and image labels. The local image includes source/compiler caches; the offline receipt records its
+archive size and identity. No image
 has been transferred to the Sparks. These checks do not qualify a real checkpoint,
 GPU execution, two-node transport or performance.
 
@@ -99,7 +99,8 @@ or spill-v2 files as if their formats were compatible. Mainline needs:
 
 The separately versioned reference is pinned in `pins.json`. Use its
 `engine/zig/tools/zig/triton_fill.py`, `dsv41_triton_options.json` and
-`dsv41_rope_tables.py` with `PYTHONPATH` pointing at its `engine/src`. Its compiler
+`dsv41_rope_tables.py` with `PYTHONPATH` pointing at the reconstructed reference's
+`src/`, as described below. The recipe no longer ships `engine/src`. Its compiler
 contract names Triton 3.7.1 and ptxas 13.3.73. Run RoPE generation on the eventual
 serving host CPU with the frozen build environment; preserve toolchain and file
 provenance. Reference Python is a build-time aid, never a fallback inference engine.
@@ -164,3 +165,52 @@ make -C mainline verify-assets CONFIG=local.json
 
 Production remains on the already-qualified Mia deployment. No activation,
 selection, routing, compaction, cache cleanup or rollback is performed here.
+
+## Offline generator and transport bundle
+
+`offline.py` only operates on workstation files and local Docker. It has no SSH,
+model-launch, production-switch or test-window activation operation.
+
+```sh
+make -C mainline offline-generators
+make -C mainline offline-plan
+make -C mainline offline-aot
+make -C mainline package
+make -C mainline verify-package
+```
+
+Generator preparation verifies the reference archive and reconstructs its missing
+Python tree exactly as upstream's `scripts/fetch-reference.sh` documents: TensorFold
+`c4646171` plus three SHA-256-pinned historical patches from recipe `391d677b`.
+This tree is a build-time dependency only. No historical Python server is launched.
+The tool layer retains the unchanged native binaries and adds generator sources
+and notices; it uses the NVIDIA base's pinned Torch/Triton and ptxas. The local
+base image must match the native validation receipt before adding that layer.
+
+Actual CPU-only preparation produced **88 kernel signatures, identical
+to the native fixture after JSON parsing**, and **130 required variants on each rank**.
+Both ranks' needs sets match. All 130 variants compiled without a GPU; repeat
+coverage checks found 130 already present and no failures for each rank. These are
+provisional profile assets, not proof of checkpoint geometry or CUDA execution.
+`offline-aot.json` binds output hashes to source, patch, image and profile identity.
+Final node settings must be rerendered and their needs rechecked before use.
+
+The image `tensorfold-dsv41:mainline-2ba55ec7-assets` is exported as a complete
+Docker archive at ignored `data/offline-image/candidate-image.tar.gz`; it is about
+11.7 GB compressed and requires no preinstalled parent. Inspection reads the entire
+gzip stream, checks its CRC and digest, and verifies every layer plus archived
+platform/runtime identity. This is not a cold-host `docker load` test. Ordered
+RootFS layers and canonical runtime configuration, rather than image ID alone,
+identify the image across Docker storage backends. Receipts record both.
+
+No checkpoint weights, private captures or credentials are packaged in the image.
+Model metadata could not be fetched at the retained public checkpoint URL during
+preparation (HTTP 404); no newer revision was substituted. At the later authorized
+window, verify the retained derived checkpoint/tokenizer/overlay and use them
+read-only for token-map generation, host-specific RoPE and native Engram packing.
+Do not treat the provisional AOT receipt as the final model-bound asset manifest.
+
+The cache migration is an additional code/qualification gate, not merely a GPU
+test: see [CACHE-MIGRATION.md](CACHE-MIGRATION.md). The native family currently
+clears its session-disk namespace at startup. No unsupported persistent-recovery
+claim or silent retention/memory-policy downgrade is accepted by this preparation.

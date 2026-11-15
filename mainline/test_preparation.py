@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 import prepare
 import profile
+import offline
 
 
 class MigrationSafety(unittest.TestCase):
@@ -46,6 +47,7 @@ class MigrationSafety(unittest.TestCase):
             self.assertIn('dsv41-mainline-2ba55ec7-rank' + str(rank), row['argv'])
             self.assertNotIn('dsv41-mia-20261112-rank', row['argv'])
             self.assertEqual(profile.environment(c, rank)['TF_DSV41_PREFILL'], 'full')
+            self.assertEqual(profile.environment(c, rank)['TF_DSV41_IMAGES'], '0')
         self.assertTrue(any('24-hour' in x for x in profile.activation_blockers(c)))
 
     def test_capacity_changes_are_refused(self):
@@ -99,6 +101,68 @@ class MigrationSafety(unittest.TestCase):
             (a / 'manifest.json').write_text(json.dumps(receipt))
             with self.assertRaisesRegex(ValueError, 'Legacy token map'):
                 profile.verify_assets(c)
+
+    def test_package_detects_changed_or_truncated_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / 'candidate-image.tar.gz'
+            archive.write_bytes(b'complete fixture')
+            record = {'archive': archive.name, 'archive_bytes': archive.stat().st_size,
+                      'archive_sha256': offline.sha(archive)}
+            (root / 'image.json').write_text(json.dumps(record))
+            self.assertEqual(offline.verify_package(root), record)
+            archive.write_bytes(b'complete fixturf')
+            with self.assertRaisesRegex(RuntimeError, 'digest/size'):
+                offline.verify_package(root)
+            archive.write_bytes(b'truncated')
+            with self.assertRaisesRegex(RuntimeError, 'digest/size'):
+                offline.verify_package(root)
+
+    def test_cached_dependency_mismatch_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / 'dependency'
+            p.write_bytes(b'operator data')
+            with patch('urllib.request.urlretrieve') as download:
+                with self.assertRaisesRegex(RuntimeError, 'Existing dependency differs'):
+                    offline.fetch('https://example.invalid/dependency', p, '0' * 64)
+                download.assert_not_called()
+            self.assertEqual(p.read_bytes(), b'operator data')
+
+    def test_archive_inspection_rejects_missing_layer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = {'architecture': 'arm64', 'rootfs': {'diff_ids': ['sha256:fixture']}, 'config': {'Cmd': ['--help']}}
+            manifest = [{'RepoTags': ['candidate:fixture'], 'Config': 'config.json', 'Layers': ['layer.tar']}]
+            runtime = hashlib.sha256(json.dumps(config['config'], sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            for include_layer in [True, False]:
+                archive = root / 'candidate-image.tar.gz'
+                with tarfile.open(archive, 'w:gz') as tar:
+                    files = {'config.json': json.dumps(config).encode(), 'manifest.json': json.dumps(manifest).encode()}
+                    if include_layer:
+                        files['layer.tar'] = b'fixture layer'
+                    for name, blob in files.items():
+                        entry = tarfile.TarInfo(name); entry.size = len(blob)
+                        tar.addfile(entry, io.BytesIO(blob))
+                record = {'image': 'candidate:fixture', 'archive': archive.name, 'archive_bytes': archive.stat().st_size,
+                          'archive_sha256': offline.sha(archive), 'rootfs_layers': config['rootfs']['diff_ids'],
+                          'runtime_config_sha256': runtime}
+                (root / 'image.json').write_text(json.dumps(record))
+                if include_layer:
+                    offline.inspect_archive(root)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'Missing image tag or layer'):
+                        offline.inspect_archive(root)
+
+    def test_image_identity_accepts_metadata_ids_but_rejects_runtime_drift(self):
+        import copy
+        first = {'Id': 'index-digest', 'Architecture': 'arm64',
+                 'RootFS': {'Layers': ['a', 'b']}, 'Config': {'Env': ['MODE=thinking'], 'Cmd': ['--help']}}
+        loaded = copy.deepcopy(first); loaded['Id'] = 'config-digest'
+        self.assertEqual(offline.image_identity(first), offline.image_identity(loaded))
+        changed = copy.deepcopy(loaded); changed['Config']['Env'] = ['MODE=no-thinking']
+        self.assertNotEqual(offline.image_identity(first), offline.image_identity(changed))
+        changed = copy.deepcopy(loaded); changed['RootFS']['Layers'].reverse()
+        self.assertNotEqual(offline.image_identity(first), offline.image_identity(changed))
 
 
 if __name__ == '__main__':

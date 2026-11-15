@@ -43,7 +43,7 @@ def environment(c, rank):
             'TF_DSV41_ENGRAM_DIR': '/engram', 'TF_DSV41_PREPARED': '/prepared',
             'TF_DSV41_PREPARED_WRITE': '1', 'TF_DSV41_PREPARED_VERIFY': '1',
             'TF_DSV41_PREFILL': 'full', 'TF_DSV41_OWN_PREFILL': '1',
-            'TF_DSV41_PROMPT_TAIL': 'verify', 'TF_DSV41_IMAGES': 'placeholder',
+            'TF_DSV41_PROMPT_TAIL': 'verify', 'TF_DSV41_IMAGES': '0',
             'TF_DSV41_PREFILL_PIECES': '1', 'TF_DSV41_SESSION_SLOTS': '1',
             'TF_DSV41_SESSIONS': '1', 'TF_DSV41_SESSION_RAM_MIB': '128',
             'TF_DSV41_FLOOR_GIB': '3.5', 'TF_DSV41_FLOOR_HARD_GIB': '2.5'}
