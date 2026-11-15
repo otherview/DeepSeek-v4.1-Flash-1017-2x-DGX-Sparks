@@ -1,5 +1,5 @@
 {
-  "status": "CPU source/build preparation passed; no CUDA image or GPU qualification claimed",
+  "status": "CPU preparation and native ARM64 CUDA image build passed; GPU qualification pending",
   "tensorfold": "2ba55ec7d32d0bec446bb012678550be7ef52895",
   "patches": [
     "72b14dc2ea93a6c548b2490646655f92d17743ad289f4d614cbd87cbb53f96b4",
@@ -38,7 +38,6 @@
   },
   "production_operations": [],
   "unrun": [
-    "CUDA/NVCC image build",
     "Real-checkpoint token map, RoPE, AOT and packed Engram generation",
     "Independent GPU correctness/concurrency/cache-recovery/performance",
     "Persistent cache policy parity and graph memory bounds",
@@ -49,5 +48,76 @@
     "exit_code": 0,
     "result": "Check complete, no warnings found; metadata only, no CUDA image build"
   },
-  "compiler_url_http": 200
+  "compiler_url_http": 200,
+  "native_image": {
+    "tag": "tensorfold-dsv41:mainline-2ba55ec7",
+    "id": "sha256:584422fbf6582dc73ee609b9f6b0601acad8ce52fb0f6f050a153a305ef8af77",
+    "architecture": "arm64",
+    "size_bytes": 38381912925,
+    "dockerfile_sha256": "ce1aff4fc4c2067a732dad696d726cbdca9333571f03728ab3f4d6967e6f3f2f",
+    "build_exit_code": 0,
+    "build_log_sha256": "367282cef74001d2b3067cdeb0e9dfe9acf8e27382731d988c87ec07757b985b",
+    "initial_attempt": "Rejected custom non-MAJOR.MINOR.PATCH version override; removed override and rebuilt successfully with upstream version handling",
+    "runtime_smoke": {
+      "grammar_load": true,
+      "files": {
+        "bin/tensorfold-dsv41": {
+          "sha256": "fd683e0368f57b86e9feb9cdd8d9b65130ee6dbea849471de35b0f48f3856c00",
+          "bytes": 89166704
+        },
+        "bin/tf-dsv41": {
+          "sha256": "69da6edada2bfcba29bd79ef7de06170b8d6cb75364f00e46a72d0c347421e45",
+          "bytes": 67698592
+        },
+        "bin/tf-dsv41-assets": {
+          "sha256": "dc32ecdfdb5f990709cb9eec311cc69d22261e67c96c393a0215c97cdc428af6",
+          "bytes": 6717544
+        },
+        "bin/tf-dsv41-token-map": {
+          "sha256": "a106e5fd9e2f1fc8eb8f92d7a9916a441b40604d1774baf6cd56a688a21f0993",
+          "bytes": 5614952
+        },
+        "native/lib/libtfgrammar.so": {
+          "sha256": "50474c13ef23a0728b3d7474bbee8d6fa70704f797797764974a0b6e05e19b06",
+          "bytes": 2982056
+        }
+      }
+    },
+    "capabilities": {
+      "version": "1.2.9",
+      "backends": [
+        "cuda"
+      ],
+      "families": {
+        "deepseek_v41": [
+          "exl3"
+        ]
+      },
+      "required_flags_present": [
+        "--context",
+        "--max-tokens",
+        "--parallel",
+        "--thinking",
+        "--loop-guard"
+      ]
+    },
+    "help_commands_exit_code": 0,
+    "scope": "CPU-only local build and loading; no GPU, model weights, inference or deployment"
+  },
+  "native_grammar_tests": {
+    "command": [
+      "zig",
+      "build",
+      "-j2",
+      "test-grammar-budget",
+      "test-grammar-tools",
+      "-Dxgrammar=/xgrammar",
+      "--summary",
+      "all"
+    ],
+    "exit_code": 0,
+    "summary": "8/8 steps succeeded; 52/52 tests passed (46 tool grammar, 6 budget)",
+    "log_sha256": "33cb11ce91ace2ba0159b115f1719d6a4d65dfdb9e02fb031c3f3c8a9fd8fa04",
+    "scope": "CPU-only, real pinned libtfgrammar, no network or model"
+  }
 }

@@ -69,8 +69,20 @@ v0.2.8 commit/submodules. No model runs during image construction. Base images,
 compiler/C++ caches and CUDA compilation need additional multi-GiB disk and
 memory; the large NVIDIA base is already present on the production hosts, but
 **no build was run there**. Do not compile on a busy serving host without a
-separately authorized resource window. The CUDA image itself has not been built
-or qualified during this CPU preparation.
+separately authorized resource window.
+
+The Linux ARM64 image **was built successfully on the workstation**, including
+SM121 CUDA kernels, both native binaries and the grammar library. CPU-only smoke
+checks passed: capabilities report CUDA/DeepSeek EXL3 and the planned thinking,
+loop-guard, context, parallel and token-limit flags; server/asset help commands
+run, and `libtfgrammar.so` loads. The real-library tool-grammar and budget suite also passed **52/52 tests**.
+Image and binary hashes are in `VALIDATION.json`.
+The initial build rejected a custom version override; the Dockerfile now uses
+upstream version handling (reports 1.2.9), with the exact source identity carried
+by the pinned revision and image labels. The image is local only, approximately
+11.75 GB in Docker's reported size, with source/compiler caches included. No image
+has been transferred to the Sparks. These checks do not qualify a real checkpoint,
+GPU execution, two-node transport or performance.
 
 ## Model assets are a separate stage
 

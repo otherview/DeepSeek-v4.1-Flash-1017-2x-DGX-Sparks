@@ -18,7 +18,7 @@ WORKDIR /source
 RUN /opt/zig/zig build -j2 dsv41-assets dsv41-engram-pack dsv41-serve grammar \
     -Dxgrammar=/xgrammar -Doptimize=ReleaseSafe -Dsm=121 \
     -Dnvcc=/usr/local/cuda/bin/nvcc -Ddsv41-nvcc=/usr/local/cuda/bin/nvcc \
-    -Dversion=1.2.9-dev+mia-mainline.2ba55ec7 --prefix /opt/tensorfold-main && \
+    --prefix /opt/tensorfold-main && \
     test -x /opt/tensorfold-main/bin/tensorfold-dsv41 && \
     test -x /opt/tensorfold-main/bin/tf-dsv41 && \
     test -s /opt/tensorfold-main/native/lib/libtfgrammar.so
